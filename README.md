@@ -54,7 +54,9 @@ This is the recommended method for deployment.
           - 3347:3347 # Expose the web UI port
         volumes:
           # Mount the config directory for persistent settings (Optional)
-          - ./config:/app/config 
+          - ./config:/app/config
+          # Mount the download location of the file (Optional)
+          - ./torrent-data:/app/torrent-data
         restart: unless-stopped
     ```
     *   **Optional Persistence:** By default, settings (Proxy, Prowlarr/Jackett) are stored inside the container and will be lost if the container is restarted. To make settings persistent across restarts, you can mount a local directory from your host to `/app/config` inside the container using the `volumes` option above. 
@@ -84,6 +86,8 @@ Alternatively, you can run the container directly using `docker run`:
       -p 3347:3347 \
       # Add the volume mount below ONLY if you want persistent settings (and created ./config above)
       -v $(pwd)/config:/app/config \
+      # The location where the downloaded file is saved
+      -v $(pwd)/torrent-data:/app/torrent-data \
       --restart unless-stopped \
       ghcr.io/aculix/bitplay:main
     ```
