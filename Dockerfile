@@ -16,8 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o main .
 
 # Final stage
 FROM alpine:3.22
-# ffmpeg powers MKV remuxing and audio-track selection (adds ~100MB;
-# BitPlay runs without it, minus those features)
+# ffmpeg is used for MKV remuxing and audio track selection
 RUN apk --no-cache add ca-certificates ffmpeg
 
 # ARG APP_VERSION, will be set during build by github actions

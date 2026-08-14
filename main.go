@@ -45,14 +45,11 @@ type TorrentSession struct {
 	Torrent  *torrent.Torrent
 	Port     int
 	LastUsed time.Time
-	// ActiveStreams guards long-lived responses (direct play or remux)
-	// against the idle-session cleanup
 	ActiveStreams int32
 	ProbeMu       sync.Mutex
 	ProbeCache    map[int]*ProbeResult
 }
 
-// ProbeStream describes one media stream inside a probed file
 type ProbeStream struct {
 	Index    int    `json:"index"` // absolute ffmpeg stream index
 	Type     string `json:"type"`  // video | audio | subtitle
@@ -64,8 +61,6 @@ type ProbeStream struct {
 	Default  bool   `json:"default"`
 }
 
-// ProbeResult is the ffprobe summary served to the frontend, which makes
-// the direct-play/remux/unsupported decision with canPlayType()
 type ProbeResult struct {
 	Container string        `json:"container"`
 	Duration  float64       `json:"duration"`
@@ -81,14 +76,10 @@ type Settings struct {
 	EnableJackett  bool   `json:"enableJackett"`
 	JackettHost    string `json:"jackettHost"`
 	JackettApiKey  string `json:"jackettApiKey"`
-	// Outbound Prowlarr/Jackett request tuning (issue #11)
 	SearchTimeoutSeconds int  `json:"searchTimeoutSeconds"`
 	SkipTLSVerify        bool `json:"skipTlsVerify"`
 }
 
-// searchTimeout returns the configured Prowlarr/Jackett timeout, defaulting
-// to 30s for missing/invalid values (also what pre-existing settings.json
-// files without the field decode to).
 func searchTimeout() time.Duration {
 	settingsMutex.RLock()
 	defer settingsMutex.RUnlock()
@@ -127,8 +118,6 @@ var (
 	portMutex sync.Mutex
 )
 
-// ringLogBuffer keeps the most recent log lines in memory for the
-// diagnostics view (issue #22)
 type ringLogBuffer struct {
 	mu    sync.Mutex
 	lines []string
@@ -157,8 +146,6 @@ func (b *ringLogBuffer) Lines() []string {
 
 var logBuffer = &ringLogBuffer{max: 500}
 
-// ---- ffmpeg integration (issues #9, #12, #23) ----
-
 var (
 	serverPort      = 3347
 	ffmpegPath      string
@@ -166,13 +153,9 @@ var (
 	ffmpegAvailable bool
 	ffmpegVersion   string
 	remuxSlots      chan struct{}
-	// Authorization header ffmpeg/ffprobe send on loopback stream reads
-	// when basic auth is enabled
 	loopbackAuthHeader string
 )
 
-// checkFFmpeg detects ffmpeg/ffprobe at startup; without them the remux and
-// probe endpoints report 501 and the frontend falls back to direct playback
 func checkFFmpeg() {
 	maxRemux := 3
 	if v, err := strconv.Atoi(os.Getenv("BITPLAY_MAX_REMUX")); err == nil && v > 0 {
@@ -212,15 +195,12 @@ func capabilitiesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// loopbackStreamURL lets ffmpeg read a torrent file through the existing
-// stream endpoint: the input is seekable (range requests -> Reader.Seek),
-// so MKV cues and moov-at-end MP4s work, and anacrolix prioritizes exactly
-// the pieces ffmpeg asks for - partially-downloaded files stream for free
+// ffmpeg reads torrent files through the stream endpoint so the input is
+// seekable and partially-downloaded files work
 func loopbackStreamURL(sessionID string, fileIndex int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/api/v1/torrent/%s/stream/%d", serverPort, sessionID, fileIndex)
 }
 
-// limitedWriter keeps the head of ffmpeg's stderr for error logs
 type limitedWriter struct {
 	buf bytes.Buffer
 	max int
@@ -260,9 +240,8 @@ var proxyTransport = &http.Transport{
 	MaxIdleConnsPerHost:   10,
 }
 
-// basicAuthMiddleware protects every route with HTTP basic auth when both
-// BITPLAY_AUTH_USERNAME and BITPLAY_AUTH_PASSWORD are set (issue #20, for
-// instances exposed to the public internet). With either unset it is a no-op.
+// Basic auth for the whole app when BITPLAY_AUTH_USERNAME and
+// BITPLAY_AUTH_PASSWORD are both set; a no-op otherwise
 func basicAuthMiddleware(next http.Handler) http.Handler {
 	username := os.Getenv("BITPLAY_AUTH_USERNAME")
 	password := os.Getenv("BITPLAY_AUTH_PASSWORD")
@@ -270,10 +249,8 @@ func basicAuthMiddleware(next http.Handler) http.Handler {
 		return next
 	}
 
-	// Compare digests so timing doesn't leak length or content
 	userHash := sha256.Sum256([]byte(username))
 	passHash := sha256.Sum256([]byte(password))
-	// ffmpeg's loopback stream reads must authenticate like everyone else
 	loopbackAuthHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 	log.Println("Basic authentication enabled (BITPLAY_AUTH_USERNAME/BITPLAY_AUTH_PASSWORD)")
 
@@ -315,7 +292,6 @@ func createSelectiveProxyClient() *http.Client {
 
 	timeout := searchTimeout()
 
-	// For self-signed Prowlarr/Jackett certificates (opt-in setting)
 	var tlsConfig *tls.Config
 	if skipVerify {
 		tlsConfig = &tls.Config{InsecureSkipVerify: true}
@@ -342,8 +318,6 @@ func createSelectiveProxyClient() *http.Client {
 	// Drop any old idle conns after reconfiguration:
 	proxyTransport.CloseIdleConnections()
 
-	// Fresh client per call: callers may tweak CheckRedirect, and the
-	// timeout tracks the current settings
 	return &http.Client{
 		Transport:     proxyTransport,
 		Timeout:       timeout,
@@ -527,10 +501,8 @@ func init() {
 }
 
 func main() {
-	// Keep recent log lines in memory for the diagnostics endpoint
 	log.SetOutput(io.MultiWriter(os.Stderr, logBuffer))
 
-	// Detect ffmpeg/ffprobe for the remux pipeline
 	checkFFmpeg()
 
 	// Seed random number generator
@@ -548,7 +520,6 @@ func main() {
 			snapshot := currentSettings
 			settingsMutex.RUnlock()
 
-			// Never expose API keys; the client only needs to know whether one is stored
 			resp := struct {
 				Settings
 				ProwlarrApiKeySet bool `json:"prowlarrApiKeySet"`
@@ -576,9 +547,7 @@ func main() {
 	http.HandleFunc("/api/v1/capabilities", capabilitiesHandler)
 
 	// Set up client file serving
-	// no-cache = browsers revalidate on every load (cheap 304s), so users
-	// pick up new frontend code right after an update instead of running a
-	// stale cached bundle against a newer API
+	// no-cache: revalidate on every load so updates aren't stuck behind stale assets
 	fileServer := http.FileServer(http.Dir("./client"))
 	noCacheFiles := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
@@ -601,7 +570,6 @@ func main() {
 	// Create a server with graceful shutdown
 	server := &http.Server{
 		Addr: addr,
-		// Optional basic auth wraps the whole app: UI, API, and streams
 		Handler: basicAuthMiddleware(http.DefaultServeMux),
 	}
 
@@ -839,7 +807,7 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 	session := sessionValue.(*TorrentSession)
 	session.LastUsed = time.Now() // Update last used time
 
-	// Guard against sessions whose metadata never arrived; Files() panics without info
+	// Files() panics if metadata never arrived
 	if session.Torrent.Info() == nil {
 		respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "Torrent metadata not available yet",
@@ -847,7 +815,6 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Codec probe and ffmpeg remux endpoints
 	if len(parts) > 6 && parts[5] == "probe" {
 		handleProbe(w, r, session, sessionID, parts[6])
 		return
@@ -888,8 +855,7 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("Streaming file: %s (type: %s)", fileName, extension)
 
-		// CORS for every streamed response (video.js promotes media requests to
-		// CORS mode when text tracks are present, so video needs this too)
+		// video.js switches media requests to CORS mode when text tracks are attached
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length")
 
@@ -942,8 +908,7 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 				closer.Close()
 			}
 		}()
-		// A browser can hold one streaming response open for a long time
-		// without issuing new requests; keep the session off the idle GC
+		// keep the session off the idle GC while this response is open
 		atomic.AddInt32(&session.ActiveStreams, 1)
 		defer atomic.AddInt32(&session.ActiveStreams, -1)
 		http.ServeContent(w, r, fileName, time.Time{}, reader)
@@ -965,16 +930,13 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 
 // Add a function to convert SRT to VTT format
 func convertSRTtoVTT(srtBytes []byte) []byte {
-	// Strip UTF-8 BOM; a BOM after the WEBVTT header breaks cue parsing
+	// a BOM after the WEBVTT header breaks cue parsing
 	srtBytes = bytes.TrimPrefix(srtBytes, []byte{0xEF, 0xBB, 0xBF})
 	srtContent := strings.ReplaceAll(string(srtBytes), "\r\n", "\n")
 
 	var vtt strings.Builder
 	vtt.WriteString("WEBVTT\n\n")
 
-	// SRT cues are blank-line separated: sequence number, timestamps, text.
-	// Only drop the leading sequence number of each cue so numeric caption
-	// text survives, and only rewrite commas on the timestamp line.
 	for _, block := range strings.Split(srtContent, "\n\n") {
 		lines := strings.Split(strings.TrimSpace(block), "\n")
 		if len(lines) == 0 || lines[0] == "" {
@@ -1017,8 +979,7 @@ func cleanupSessions() {
 		sessions.Range(func(key, value interface{}) bool {
 			session := value.(*TorrentSession)
 
-			// A stream response can stay open far longer than the idle
-			// window without issuing new requests - never reap those
+			// never reap a session with an open stream response
 			if atomic.LoadInt32(&session.ActiveStreams) > 0 {
 				session.LastUsed = time.Now()
 				return true
@@ -1034,9 +995,7 @@ func cleanupSessions() {
 	}
 }
 
-// runFFprobe analyzes the media file behind streamURL. On a fresh torrent
-// the header pieces may not be local yet - reads block until they arrive,
-// hence the generous timeout.
+// reads block until the header pieces arrive, hence the generous timeout
 func runFFprobe(ctx context.Context, streamURL string) (*ProbeResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -1101,7 +1060,6 @@ func runFFprobe(ctx context.Context, streamURL string) (*ProbeResult, error) {
 	return result, nil
 }
 
-// handleProbe serves cached-or-fresh codec facts for one file in a session
 func handleProbe(w http.ResponseWriter, r *http.Request, session *TorrentSession, sessionID, indexStr string) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	if !ffmpegAvailable {
@@ -1144,11 +1102,8 @@ func handleProbe(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	respondWithJSON(w, http.StatusOK, result)
 }
 
-// handleRemux repackages a file into a progressive fragmented MP4 with
-// stream copy (no re-encoding): MKV/AVI containers whose codecs the browser
-// can decode become playable, and ?audio=N picks an audio track. ?t=S
-// restarts from an offset for seek support. A future transcode option would
-// swap -c copy for encoders right here with the same lifecycle.
+// Stream-copy remux into progressive fragmented MP4. ?audio=N picks an
+// audio track, ?t=S restarts from an offset.
 func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession, sessionID, indexStr string) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	if !ffmpegAvailable {
@@ -1162,7 +1117,7 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 		return
 	}
 
-	// Strictly numeric query params (they end up in the ffmpeg argv)
+	// params end up in the ffmpeg argv, numeric only
 	audioStream := -1
 	if a := r.URL.Query().Get("audio"); a != "" {
 		audioStream, err = strconv.Atoi(a)
@@ -1180,7 +1135,6 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 		}
 	}
 
-	// Bound concurrent ffmpeg processes
 	select {
 	case remuxSlots <- struct{}{}:
 		defer func() { <-remuxSlots }()
@@ -1192,8 +1146,6 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	atomic.AddInt32(&session.ActiveStreams, 1)
 	defer atomic.AddInt32(&session.ActiveStreams, -1)
 
-	// The probe tells us whether the video is HEVC (needs the hvc1 tag or
-	// Safari refuses the remuxed fMP4)
 	videoCodec := ""
 	session.ProbeMu.Lock()
 	if probe := session.ProbeCache[fileIndex]; probe != nil {
@@ -1211,7 +1163,6 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 		args = append(args, "-headers", "Authorization: "+loopbackAuthHeader+"\r\n")
 	}
 	if startSeconds > 0 {
-		// -ss before -i seeks via container cues on the seekable input
 		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
 	args = append(args, "-i", loopbackStreamURL(sessionID, fileIndex), "-map", "0:v:0")
@@ -1222,7 +1173,7 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	}
 	args = append(args, "-c", "copy", "-sn")
 	if videoCodec == "hevc" {
-		args = append(args, "-tag:v", "hvc1")
+		args = append(args, "-tag:v", "hvc1") // Safari rejects the default hev1 tag
 	}
 	args = append(args,
 		"-avoid_negative_ts", "make_zero",
@@ -1230,8 +1181,7 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 		"-f", "mp4", "pipe:1",
 	)
 
-	// Client disconnect cancels the request context, which kills ffmpeg;
-	// WaitDelay escalates to SIGKILL if it lingers
+	// client disconnect cancels the context and kills ffmpeg
 	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
 	cmd.WaitDelay = 3 * time.Second
 	stderr := &limitedWriter{max: 4096}
@@ -1247,8 +1197,6 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	}
 	log.Printf("Remux started for session %s file %d (audio=%d t=%.1f)", sessionID, fileIndex, audioStream, startSeconds)
 
-	// Chunked progressive fMP4: no byte-range seeking on this response,
-	// the frontend restarts with ?t= instead
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Accept-Ranges", "none")
 	w.Header().Set("Cache-Control", "no-store")
@@ -1259,8 +1207,6 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	}
 }
 
-// teardownSession releases everything a session holds; used by both the
-// idle cleanup and the purge endpoint
 func teardownSession(key interface{}, session *TorrentSession) {
 	releasePort(session.Port)
 	if session.Torrent != nil {
@@ -1272,7 +1218,6 @@ func teardownSession(key interface{}, session *TorrentSession) {
 	sessions.Delete(key)
 }
 
-// Diagnostics: recent in-memory log lines (issue #22)
 func logsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1281,7 +1226,6 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{"lines": logBuffer.Lines()})
 }
 
-// Diagnostics: active torrent sessions with progress/peer stats (issue #22)
 func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1311,7 +1255,6 @@ func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, list)
 }
 
-// dirSize sums the file sizes under path
 func dirSize(path string) int64 {
 	var total int64
 	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
@@ -1323,9 +1266,7 @@ func dirSize(path string) int64 {
 	return total
 }
 
-// purgeCacheHandler stops every torrent session and deletes the on-disk
-// cache; nothing else ever removes torrent-data, so it grows without bound
-// otherwise (issue #21)
+// stops every session and wipes torrent-data; nothing else ever deletes it
 func purgeCacheHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1341,7 +1282,6 @@ func purgeCacheHandler(w http.ResponseWriter, r *http.Request) {
 	const dataDir = "./torrent-data"
 	freed := dirSize(dataDir)
 
-	// All clients are closed, so the piece-completion DB can go too
 	entries, err := os.ReadDir(dataDir)
 	if err != nil && !os.IsNotExist(err) {
 		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read cache directory: " + err.Error()})
@@ -1867,7 +1807,7 @@ func saveSettingsToFile() error {
 		return err
 	}
 	defer file.Close()
-	// Tighten pre-existing files too (mode above only applies on creation)
+	// the mode above only applies on creation
 	if err := file.Chmod(0600); err != nil {
 		log.Printf("Warning: could not chmod settings.json: %v", err)
 	}

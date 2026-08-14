@@ -88,11 +88,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     startPlayback();
   });
 
-  // ---- Playback compatibility (issues #9, #12, #23) ----
-  // The server probes files with ffprobe and remuxes MKV/AVI into
-  // fragmented MP4 with stream copy; the browser decides direct vs remux
-  // vs unsupported here, because only it knows what it can decode.
-
+  // Playback compatibility: the server probes and remuxes, the browser
+  // decides direct vs remux vs unsupported since only it knows its codecs
   const MIME_BY_EXT = {
     mp4: "video/mp4",
     m4v: "video/mp4",
@@ -113,8 +110,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     return capabilitiesCache;
   };
 
-  // Representative MIME strings per probed codec; canPlayType has the
-  // final say. Codecs missing here are treated as undecodable.
+  // codecs missing here are treated as undecodable
   const CODEC_TYPES = {
     h264: 'video/mp4; codecs="avc1.640029"',
     hevc: 'video/mp4; codecs="hvc1.1.6.L123.B0"',
@@ -135,9 +131,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     return type ? codecProbeEl.canPlayType(type) !== "" : false;
   };
 
-  // Decide how to play one torrent file. Returns {mode, src, type, ...}:
-  // direct (untouched fast path), remux (ffmpeg repackage), or
-  // unsupported (browser can't decode the video codec at all).
   const pickSource = async (sessionId, file) => {
     const directUrl = "/api/v1/torrent/" + sessionId + "/stream/" + file.index;
     const ext = file.name.split(".").pop().toLowerCase();
@@ -164,11 +157,11 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         break;
       }
       if (!res || res.status !== 504) {
-        break; // only the "pieces not here yet" timeout is worth retrying
+        break;
       }
     }
     if (!probe) {
-      return fallback; // never worse than the old behavior
+      return fallback;
     }
 
     const video = probe.streams.find((s) => s.type === "video");
@@ -189,7 +182,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       return { ...fallback, probe };
     }
 
-    // Browser-friendly codecs in a container it can't demux -> remux
     const remuxUrl = (opts = {}) => {
       const params = new URLSearchParams();
       if (opts.audio != null) params.set("audio", opts.audio);
@@ -226,8 +218,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     }
   };
 
-  // Honest fallback for files the browser truly can't play: hand the user
-  // the direct stream URL, which VLC/mpv play natively
   const showExternalPanel = (chosen) => {
     removeExternalPanel();
     const absUrl = new URL(chosen.directUrl, location.href).href;
@@ -242,7 +232,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     msg.textContent =
       `This video is ${codec}` +
       `${chosen.video && chosen.video.profile ? " (" + chosen.video.profile + ")" : ""}` +
-      ", which this browser can't decode. Play it in an external player instead — VLC and mpv handle it natively.";
+      ", which this browser can't decode. Use an external player like VLC or mpv.";
 
     const row = document.createElement("div");
     row.className = "flex flex-wrap gap-2";
@@ -254,8 +244,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     copyBtn.addEventListener("click", () => {
       navigator.clipboard.writeText(absUrl).then(() => {
         butterup.toast({
-          message:
-            "Stream URL copied — in VLC use Media → Open Network Stream",
+          message: "Stream URL copied. In VLC: Media > Open Network Stream",
           location: "top-right",
           icon: true,
           dismissable: true,
@@ -275,9 +264,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     panel.scrollIntoView({ behavior: "smooth" });
   };
 
-  // Remux streams are chunked fMP4: no byte-range seeking. Report the
-  // probed duration, translate timeline positions by the stream's start
-  // offset, and restart ffmpeg with ?t= for out-of-buffer seeks.
+  // Remux streams can't byte-range seek; out-of-buffer seeks restart
+  // ffmpeg at the target time
   const attachRemuxPlayback = (chosen) => {
     if (!player.__origCurrentTime) {
       player.__origCurrentTime = player.currentTime.bind(player);
@@ -315,7 +303,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       if (local >= 0 && local <= bufferedEnd) {
         player.__origCurrentTime(local);
       } else {
-        // Restart from the target position (debounced against seek storms)
         clearTimeout(seekTimer);
         seekTimer = setTimeout(() => reload(target), 400);
       }
@@ -349,7 +336,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     document.querySelector("#video-player").appendChild(select);
   };
 
-  // Wire everything a chosen source needs after the player exists
   const setupChosenPlayback = (chosen) => {
     const oldAudioSelect = document.querySelector("#audio-select");
     if (oldAudioSelect) {
@@ -372,16 +358,14 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         });
       }
     } else if (player.__origCurrentTime) {
-      // Back on a direct source: restore the untouched player methods
+      // back on a direct source, restore the original methods
       delete player.currentTime;
       delete player.duration;
     }
   };
 
-  // Named function instead of dispatching synthetic "submit" events: a
-  // scripted Event("submit") is non-cancelable, so preventDefault() was a
-  // no-op in Firefox and the browser performed a real form submission,
-  // reloading the page and aborting every in-flight request.
+  // Never dispatch synthetic submit events at this form: they're
+  // non-cancelable, so Firefox runs a real submission and reloads the page
   async function startPlayback() {
     const magnet = document.querySelector("#magnet").value;
 
@@ -519,7 +503,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         };
       });
     }
-    // Probe the file and pick direct play, remux, or honest failure
     const chosen = await pickSource(sessionId, videoFiles[0]);
 
     if (chosen.mode === "unsupported") {
@@ -584,8 +567,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
             dismissable: true,
             type: "error",
           });
-          // Decode/format failures won't fix themselves - offer the
-          // external-player way out
           if (mediaError && (mediaError.code === 3 || mediaError.code === 4)) {
             showExternalPanel(chosen);
           }
@@ -597,8 +578,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
 
     document.querySelector("#video-player").style.display = "block";
 
-    // Keep the subtitle-upload control right under the current player
-    // (the video element is re-created for every playback)
+    // the video element is re-created per playback, move the control with it
     const subtitleUploadWrapper = document.querySelector(
       "#subtitle-upload-wrapper"
     );
@@ -699,7 +679,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     });
   });
 
-  // Maintenance tab: session stats, recent logs, cache purge
   const formatBytes = (n) => {
     if (!n) return "0 B";
     const units = ["B", "KB", "MB", "GB", "TB"];
@@ -725,7 +704,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         sessionList.forEach((s) => {
           const line = document.createElement("div");
           const pct = s.size ? Math.round((s.complete / s.size) * 100) : 0;
-          line.textContent = `${s.name} — ${pct}% of ${formatBytes(
+          line.textContent = `${s.name}: ${pct}% of ${formatBytes(
             s.size
           )}, ${s.peers} peers`;
           statsEl.appendChild(line);
@@ -774,7 +753,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         throw new Error(data.error || "Failed to purge cache");
       }
       butterup.toast({
-        message: `Cache purged — freed ${data.freed}`,
+        message: `Cache purged, freed ${data.freed}`,
         location: "top-right",
         icon: true,
         dismissable: true,
@@ -859,7 +838,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     const end = start + searchPageSize;
     const results = searchData.slice(start, end);
     results.forEach((result) => {
-      // Build with textContent — indexer data is untrusted
+      // indexer data is untrusted, build with textContent
       const row = document.createElement("tr");
       [
         result.title,
@@ -938,7 +917,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       apiUrl = "/api/v1/jackett/search";
     }
 
-    // Give the server its configured timeout plus a little slack
     const timeoutMs = ((settings?.searchTimeoutSeconds || 30) + 5) * 1000;
 
     fetch(`${apiUrl}?q=${encodeURIComponent(query)}`, {
@@ -988,7 +966,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     const prowlarrApiKey = document.querySelector("#prowlarrApiKey").value;
     const prowlarrTestBtn = document.querySelector("#test-prowlarr");
 
-    // Empty key is fine when one is already saved server-side
     if (!prowlarrHost || (!prowlarrApiKey && !settings?.prowlarrApiKeySet)) {
       butterup.toast({
         message: "Please enter Prowlarr host and API key",
@@ -1046,7 +1023,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     const jackettApiKey = document.querySelector("#jackettApiKey").value;
     const jackettTestBtn = document.querySelector("#test-jackett");
 
-    // Empty key is fine when one is already saved server-side
     if (!jackettHost || (!jackettApiKey && !settings?.jackettApiKeySet)) {
       butterup.toast({
         message: "Please enter Jackett host and API key",
@@ -1293,10 +1269,9 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         const prowlarrKeyInput = document.querySelector("#prowlarrApiKey");
         prowlarrKeyInput.value = "";
         if (settings.prowlarrApiKeySet) {
-          prowlarrKeyInput.placeholder = "Saved — leave blank to keep";
+          prowlarrKeyInput.placeholder = "Saved (leave blank to keep)";
         }
 
-        // Mirror the shared search options into the Jackett tab
         document.querySelector("#jackettTimeout").value =
           body.searchTimeoutSeconds || "";
         document.querySelector("#jackettSkipTls").checked = body.skipTlsVerify;
@@ -1381,10 +1356,9 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       const jackettKeyInput = document.querySelector("#jackettApiKey");
       jackettKeyInput.value = "";
       if (settings.jackettApiKeySet) {
-        jackettKeyInput.placeholder = "Saved — leave blank to keep";
+        jackettKeyInput.placeholder = "Saved (leave blank to keep)";
       }
 
-      // Mirror the shared search options into the Prowlarr tab
       document.querySelector("#prowlarrTimeout").value =
         body.searchTimeoutSeconds || "";
       document.querySelector("#prowlarrSkipTls").checked = body.skipTlsVerify;
@@ -1402,7 +1376,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     submitButton.innerHTML = "Save Settings";
   });
 
-  // Shared by the file picker and the drop zone
   const playTorrentFile = (file) => {
     const formData = new FormData();
     formData.append("torrent", file);
@@ -1441,8 +1414,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     }
   });
 
-  // Upload a local subtitle file into the current player (issue #15).
-  // Conversion happens in the browser; nothing is sent to the server.
+  // subtitle upload stays entirely in the browser
   const srtToVtt = (srt) => {
     const text = srt.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
     let vtt = "WEBVTT\n\n";
@@ -1486,7 +1458,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         false
       );
 
-      // Show the new track right away, hiding whichever was active
       const tracks = player.textTracks();
       for (let i = 0; i < tracks.length; i++) {
         tracks[i].mode = tracks[i] === added.track ? "showing" : "disabled";
@@ -1556,20 +1527,18 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         data.enableJackett || false;
       document.querySelector("#jackettHost").value = data.jackettHost || "";
 
-      // The server never returns stored API keys; show a hint instead and
-      // leave the field blank ("blank" = keep the saved key on save/test)
+      // a blank key field means keep the saved one
       const prowlarrKeyInput = document.querySelector("#prowlarrApiKey");
       prowlarrKeyInput.value = "";
       prowlarrKeyInput.placeholder = data.prowlarrApiKeySet
-        ? "Saved — leave blank to keep"
+        ? "Saved (leave blank to keep)"
         : "Your Prowlarr API key";
       const jackettKeyInput = document.querySelector("#jackettApiKey");
       jackettKeyInput.value = "";
       jackettKeyInput.placeholder = data.jackettApiKeySet
-        ? "Saved — leave blank to keep"
+        ? "Saved (leave blank to keep)"
         : "Your Jackett API key";
 
-      // Shared search options are shown in both indexer tabs
       const timeoutValue = data.searchTimeoutSeconds || "";
       document.querySelector("#prowlarrTimeout").value = timeoutValue;
       document.querySelector("#jackettTimeout").value = timeoutValue;
