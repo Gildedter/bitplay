@@ -251,7 +251,7 @@
             </svg>
           </button>
         </div>
-        <div class="flex gap-2 mb-7">
+        <div class="flex flex-wrap gap-2 mb-7">
           <button
             class="tab-btn flex items-center gap-2 px-4 py-2 rounded-lg transition-colors border bg-primary text-primary-foreground"
             data-index="0"
@@ -320,6 +320,29 @@
               <line x1="6" x2="6.01" y1="18" y2="18"></line>
             </svg>
             <span>Jackett</span>
+          </button>
+          <button
+            class="tab-btn flex items-center gap-2 px-4 py-2 rounded-lg transition-colors bg-muted border"
+            data-index="3"
+            type="button"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="lucide lucide-wrench w-4 h-4"
+            >
+              <path
+                d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
+              ></path>
+            </svg>
+            <span>Maintenance</span>
           </button>
         </div>
         <form
@@ -605,6 +628,60 @@
             </button>
           </div>
         </form>
+        <div class="tab flex flex-col gap-6 hidden" data-tab="3">
+          <div class="flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="text-muted-foreground text-sm font-semibold"
+                >Active Sessions</span
+              >
+              <button
+                type="button"
+                id="refresh-maintenance"
+                class="text-sm text-primary cursor-pointer"
+              >
+                Refresh
+              </button>
+            </div>
+            <div
+              id="session-stats"
+              class="border rounded-md p-3 text-sm text-muted-foreground max-h-40 overflow-auto"
+            >
+              No active sessions
+            </div>
+          </div>
+          <div class="flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="text-muted-foreground text-sm font-semibold"
+                >Recent Logs</span
+              >
+              <button
+                type="button"
+                id="copy-logs"
+                class="text-sm text-primary cursor-pointer"
+              >
+                Copy
+              </button>
+            </div>
+            <pre
+              id="log-output"
+              class="border rounded-md p-3 text-xs text-muted-foreground max-h-48 overflow-auto whitespace-pre-wrap"
+            >
+No logs yet</pre
+            >
+          </div>
+          <div class="flex flex-col gap-2">
+            <span class="text-muted-foreground text-sm font-semibold"
+              >Cache</span
+            >
+            <p class="text-sm text-muted-foreground">
+              Stops all torrent sessions and deletes everything downloaded to
+              disk.
+            </p>
+            <button type="button" id="purge-cache" class="btn !h-11">
+              Purge Cache
+            </button>
+          </div>
+        </div>
       </div>
     </div>
     <script src="assets/video.min.js"></script>

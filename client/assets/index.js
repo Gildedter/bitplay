@@ -377,6 +377,101 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     });
   });
 
+  // Maintenance tab: session stats, recent logs, cache purge
+  const formatBytes = (n) => {
+    if (!n) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.min(
+      Math.floor(Math.log(n) / Math.log(1024)),
+      units.length - 1
+    );
+    return `${(n / 1024 ** i).toFixed(i ? 2 : 0)} ${units[i]}`;
+  };
+
+  const refreshMaintenance = async () => {
+    try {
+      const [sessionList, logs] = await Promise.all([
+        fetch("/api/v1/sessions").then((r) => r.json()),
+        fetch("/api/v1/logs").then((r) => r.json()),
+      ]);
+
+      const statsEl = document.querySelector("#session-stats");
+      statsEl.textContent = "";
+      if (!sessionList.length) {
+        statsEl.textContent = "No active sessions";
+      } else {
+        sessionList.forEach((s) => {
+          const line = document.createElement("div");
+          const pct = s.size ? Math.round((s.complete / s.size) * 100) : 0;
+          line.textContent = `${s.name} — ${pct}% of ${formatBytes(
+            s.size
+          )}, ${s.peers} peers`;
+          statsEl.appendChild(line);
+        });
+      }
+
+      const logEl = document.querySelector("#log-output");
+      logEl.textContent = (logs.lines || []).join("\n") || "No logs yet";
+      logEl.scrollTop = logEl.scrollHeight;
+    } catch (err) {
+      console.error("Failed to refresh maintenance info:", err);
+    }
+  };
+
+  document
+    .querySelector('.tab-btn[data-index="3"]')
+    .addEventListener("click", refreshMaintenance);
+  document
+    .querySelector("#refresh-maintenance")
+    .addEventListener("click", refreshMaintenance);
+
+  document.querySelector("#copy-logs").addEventListener("click", () => {
+    navigator.clipboard
+      .writeText(document.querySelector("#log-output").textContent)
+      .then(() => {
+        butterup.toast({
+          message: "Logs copied to clipboard",
+          location: "top-right",
+          icon: true,
+          dismissable: true,
+          type: "success",
+        });
+      });
+  });
+
+  document.querySelector("#purge-cache").addEventListener("click", async () => {
+    if (!confirm("Stop all torrent sessions and delete all downloaded data?")) {
+      return;
+    }
+    const btn = document.querySelector("#purge-cache");
+    btn.setAttribute("disabled", "disabled");
+    try {
+      const res = await fetch("/api/v1/cache/purge", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to purge cache");
+      }
+      butterup.toast({
+        message: `Cache purged — freed ${data.freed}`,
+        location: "top-right",
+        icon: true,
+        dismissable: true,
+        type: "success",
+      });
+      refreshMaintenance();
+    } catch (err) {
+      butterup.toast({
+        message: err.message || "Failed to purge cache",
+        location: "top-right",
+        icon: true,
+        dismissable: true,
+        type: "error",
+      });
+    } finally {
+      btn.removeAttribute("disabled");
+    }
+  });
+
   function generatePagination(currentPage, pageSize, total, target) {
     const pagination = document.querySelector(target);
     if (!pagination) return;

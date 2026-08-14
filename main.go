@@ -99,6 +99,36 @@ var (
 	portMutex sync.Mutex
 )
 
+// ringLogBuffer keeps the most recent log lines in memory for the
+// diagnostics view (issue #22)
+type ringLogBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	max   int
+}
+
+func (b *ringLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		b.lines = append(b.lines, line)
+	}
+	if over := len(b.lines) - b.max; over > 0 {
+		b.lines = b.lines[over:]
+	}
+	return len(p), nil
+}
+
+func (b *ringLogBuffer) Lines() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, len(b.lines))
+	copy(out, b.lines)
+	return out
+}
+
+var logBuffer = &ringLogBuffer{max: 500}
+
 // Helper function to format file sizes
 func formatSize(sizeInBytes float64) string {
 	if sizeInBytes < 1024 {
@@ -391,6 +421,9 @@ func init() {
 }
 
 func main() {
+	// Keep recent log lines in memory for the diagnostics endpoint
+	log.SetOutput(io.MultiWriter(os.Stderr, logBuffer))
+
 	// Seed random number generator
 	rand.Seed(time.Now().UnixNano())
 
@@ -428,6 +461,9 @@ func main() {
 	http.HandleFunc("/api/v1/jackett/test", testJackettConnection)
 	http.HandleFunc("/api/v1/proxy/test", testProxyConnection)
 	http.HandleFunc("/api/v1/torrent/convert", convertTorrentToMagnetHandler)
+	http.HandleFunc("/api/v1/logs", logsHandler)
+	http.HandleFunc("/api/v1/sessions", sessionsHandler)
+	http.HandleFunc("/api/v1/cache/purge", purgeCacheHandler)
 
 	// Set up client file serving
 	// no-cache = browsers revalidate on every load (cheap 304s), so users
@@ -859,16 +895,116 @@ func cleanupSessions() {
 			session := value.(*TorrentSession)
 
 			if time.Since(session.LastUsed) > 15*time.Minute {
-				releasePort(session.Port)
-				session.Torrent.Drop()
-				session.Client.Close()
-				sessions.Delete(key)
+				teardownSession(key, session)
 				log.Printf("Removed unused session: %s", key)
 			}
 			return true
 		})
 		runtime.GC()
 	}
+}
+
+// teardownSession releases everything a session holds; used by both the
+// idle cleanup and the purge endpoint
+func teardownSession(key interface{}, session *TorrentSession) {
+	releasePort(session.Port)
+	if session.Torrent != nil {
+		session.Torrent.Drop()
+	}
+	if session.Client != nil {
+		session.Client.Close()
+	}
+	sessions.Delete(key)
+}
+
+// Diagnostics: recent in-memory log lines (issue #22)
+func logsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{"lines": logBuffer.Lines()})
+}
+
+// Diagnostics: active torrent sessions with progress/peer stats (issue #22)
+func sessionsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	list := []map[string]interface{}{}
+	sessions.Range(func(key, value interface{}) bool {
+		session := value.(*TorrentSession)
+		entry := map[string]interface{}{
+			"id":       key,
+			"name":     "(fetching metadata)",
+			"size":     int64(0),
+			"complete": int64(0),
+			"peers":    0,
+		}
+		if t := session.Torrent; t != nil && t.Info() != nil {
+			stats := t.Stats()
+			entry["name"] = t.Name()
+			entry["size"] = t.Length()
+			entry["complete"] = t.BytesCompleted()
+			entry["peers"] = stats.ActivePeers
+		}
+		list = append(list, entry)
+		return true
+	})
+	respondWithJSON(w, http.StatusOK, list)
+}
+
+// dirSize sums the file sizes under path
+func dirSize(path string) int64 {
+	var total int64
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// purgeCacheHandler stops every torrent session and deletes the on-disk
+// cache; nothing else ever removes torrent-data, so it grows without bound
+// otherwise (issue #21)
+func purgeCacheHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessions.Range(func(key, value interface{}) bool {
+		teardownSession(key, value.(*TorrentSession))
+		log.Printf("Purged session: %s", key)
+		return true
+	})
+
+	const dataDir = "./torrent-data"
+	freed := dirSize(dataDir)
+
+	// All clients are closed, so the piece-completion DB can go too
+	entries, err := os.ReadDir(dataDir)
+	if err != nil && !os.IsNotExist(err) {
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read cache directory: " + err.Error()})
+		return
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(dataDir, entry.Name())); err != nil {
+			respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to delete " + entry.Name() + ": " + err.Error()})
+			return
+		}
+	}
+
+	log.Printf("Cache purged, freed %s", formatSize(float64(freed)))
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"message":    "Cache purged",
+		"freedBytes": freed,
+		"freed":      formatSize(float64(freed)),
+	})
 }
 
 // Test the proxy connection
