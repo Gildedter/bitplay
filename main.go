@@ -705,6 +705,18 @@ func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reuse a live session for the same infohash instead of spinning up a
+	// second client and re-fetching metadata
+	if m, err := metainfo.ParseMagnetUri(magnet); err == nil {
+		if existing, ok := sessions.Load(m.InfoHash.HexString()); ok {
+			session := existing.(*TorrentSession)
+			session.LastUsed = time.Now()
+			log.Printf("Reusing session: %s", m.InfoHash.HexString())
+			respondWithJSON(w, http.StatusOK, map[string]string{"sessionId": m.InfoHash.HexString()})
+			return
+		}
+	}
+
 	// Use the simpler, more secure proxy configuration
 	client, port, err := initTorrentWithProxy()
 	if err != nil {
