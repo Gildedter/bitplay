@@ -79,14 +79,20 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     document.getElementById("magnet").value =
       "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftracker.empire-js.us%3A1337&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=wss%3A%2F%2Ftracker.btorrent.xyz&tr=wss%3A%2F%2Ftracker.fastcast.nz&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F&xs=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2Fsintel.torrent";
 
-    document
-      .querySelector("#torrent-form")
-      .dispatchEvent(new Event("submit"));
+    startPlayback();
   });
 
   const form = document.querySelector("#torrent-form");
-  form.addEventListener("submit", async (e) => {
+  form.addEventListener("submit", (e) => {
     e.preventDefault();
+    startPlayback();
+  });
+
+  // Named function instead of dispatching synthetic "submit" events: a
+  // scripted Event("submit") is non-cancelable, so preventDefault() was a
+  // no-op in Firefox and the browser performed a real form submission,
+  // reloading the page and aborting every in-flight request.
+  async function startPlayback() {
     const magnet = document.querySelector("#magnet").value;
 
     if (!magnet) {
@@ -135,7 +141,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       form.querySelector("button[type=submit]").removeAttribute("disabled");
       form.querySelector("button[type=submit]").innerHTML = "Play Now";
       form.querySelector("button[type=submit]").classList.remove("loader");
-      searchResults.querySelectorAll("#play-torrent").forEach((el) => {
+      document.querySelectorAll("#play-torrent").forEach((el) => {
         el.removeAttribute("disabled");
         el.innerHTML = "Watch";
         el.classList.remove("loader");
@@ -211,7 +217,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         let langName = "English";
 
         // Try to extract language code from filename
-        console.log(subFile.name);
         const langMatch = subFile.name.match(/\.([a-z]{2,3})\.(srt|vtt|sub)$/i);
         if (langMatch) {
           language = langMatch[1];
@@ -313,7 +318,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       el.innerHTML = "Watch";
       el.classList.remove("loader");
     });
-  });
+  }
 
   // create switch button
   const switchInputs = document.querySelectorAll("#switchInput");
@@ -455,9 +460,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       el.addEventListener("click", async (e) => {
         const magnet = e.target.getAttribute("data-magnet");
         document.querySelector("#magnet").value = magnet;
-        document
-          .querySelector("#torrent-form")
-          .dispatchEvent(new Event("submit"));
+        startPlayback();
         e.target.setAttribute("disabled", "disabled");
         e.target.innerHTML = "";
         e.target.classList.add("loader");
@@ -942,39 +945,42 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     submitButton.innerHTML = "Save Settings";
   });
 
+  // Shared by the file picker and the drop zone
+  const playTorrentFile = (file) => {
+    const formData = new FormData();
+    formData.append("torrent", file);
+
+    fetch("/api/v1/torrent/convert", {
+      method: "POST",
+      body: formData,
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || "Failed to upload torrent file");
+        }
+        return res.json();
+      })
+      .then((data) => {
+        document.querySelector("#magnet").value = data.magnet;
+        startPlayback();
+      })
+      .catch((error) => {
+        console.error("There was a problem with the fetch operation:", error);
+        butterup.toast({
+          message: error.message || "Failed to upload torrent file",
+          location: "top-right",
+          icon: true,
+          dismissable: true,
+          type: "error",
+        });
+      });
+  };
+
   document.querySelector("#torrent_file").addEventListener("change", (e) => {
     const file = e.target.files[0];
     if (file) {
-      const formData = new FormData();
-      formData.append("torrent", file);
-
-      fetch("/api/v1/torrent/convert", {
-        method: "POST",
-        body: formData,
-      })
-        .then(async (res) => {
-          if (!res.ok) {
-            const err = await res.json();
-            throw new Error(err.error || "Failed to upload torrent file");
-          }
-          return res.json();
-        })
-        .then((data) => {
-          document.querySelector("#magnet").value = data.magnet;
-          document
-            .querySelector("#torrent-form")
-            .dispatchEvent(new Event("submit"));
-        })
-        .catch((error) => {
-          console.error("There was a problem with the fetch operation:", error);
-          butterup.toast({
-            message: error.message || "Failed to upload torrent file",
-            location: "top-right",
-            icon: true,
-            dismissable: true,
-            type: "error",
-          });
-        });
+      playTorrentFile(file);
     }
   });
 
@@ -1001,39 +1007,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     if (files.length > 0) {
       const file = files[0];
       if (file.name.endsWith(".torrent")) {
-        const formData = new FormData();
-        formData.append("torrent", file);
-
-        fetch("/api/v1/torrent/convert", {
-          method: "POST",
-          body: formData,
-        })
-          .then(async (res) => {
-            if (!res.ok) {
-              const err = await res.json();
-              throw new Error(err.error || "Failed to upload torrent file");
-            }
-            return res.json();
-          })
-          .then((data) => {
-            document.querySelector("#magnet").value = data.magnet;
-            document
-              .querySelector("#torrent-form")
-              .dispatchEvent(new Event("submit"));
-          })
-          .catch((error) => {
-            console.error(
-              "There was a problem with the fetch operation:",
-              error
-            );
-            butterup.toast({
-              message: error.message || "Failed to upload torrent file",
-              location: "top-right",
-              icon: true,
-              dismissable: true,
-              type: "error",
-            });
-          });
+        playTorrentFile(file);
       } else {
         butterup.toast({
           message: "Please drop a valid torrent file",

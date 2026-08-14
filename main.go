@@ -650,6 +650,11 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("Streaming file: %s (type: %s)", fileName, extension)
 
+		// CORS for every streamed response (video.js promotes media requests to
+		// CORS mode when text tracks are present, so video needs this too)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length")
+
 		switch extension {
 		case ".mp4":
 			w.Header().Set("Content-Type", "video/mp4")
@@ -663,10 +668,10 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 			// For SRT, convert to VTT on-the-fly if requested as VTT
 			if r.URL.Query().Get("format") == "vtt" {
 				w.Header().Set("Content-Type", "text/vtt")
-				w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
 
 				// Read the SRT file with size limit
 				reader := file.NewReader()
+				defer reader.Close()
 				// Wrap with limiting reader to prevent memory issues (10MB max)
 				limitReader := io.LimitReader(reader, 10*1024*1024) // 10MB limit for subtitles
 				srtBytes, err := io.ReadAll(limitReader)
@@ -681,19 +686,15 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			} else {
 				w.Header().Set("Content-Type", "text/plain")
-				w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
 			}
 		case ".vtt":
 			w.Header().Set("Content-Type", "text/vtt")
-			w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
 		case ".sub":
 			w.Header().Set("Content-Type", "text/plain")
-			w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
 		default:
 			w.Header().Set("Content-Type", "application/octet-stream")
 		}
 
-		// Add CORS headers for all content
 		// Stream the file
 		reader := file.NewReader()
 		// ServeContent will close the reader when done but we need to
@@ -701,10 +702,8 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if closer, ok := reader.(io.Closer); ok {
 				closer.Close()
-				println("Closed reader***************************************")
 			}
 		}()
-		println("Serving content*****************************************")
 		http.ServeContent(w, r, fileName, time.Time{}, reader)
 		return
 	}
