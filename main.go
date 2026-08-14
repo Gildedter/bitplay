@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,11 +17,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"net/url"
@@ -42,6 +45,31 @@ type TorrentSession struct {
 	Torrent  *torrent.Torrent
 	Port     int
 	LastUsed time.Time
+	// ActiveStreams guards long-lived responses (direct play or remux)
+	// against the idle-session cleanup
+	ActiveStreams int32
+	ProbeMu       sync.Mutex
+	ProbeCache    map[int]*ProbeResult
+}
+
+// ProbeStream describes one media stream inside a probed file
+type ProbeStream struct {
+	Index    int    `json:"index"` // absolute ffmpeg stream index
+	Type     string `json:"type"`  // video | audio | subtitle
+	Codec    string `json:"codec"`
+	Profile  string `json:"profile,omitempty"`
+	Language string `json:"language,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Channels int    `json:"channels,omitempty"`
+	Default  bool   `json:"default"`
+}
+
+// ProbeResult is the ffprobe summary served to the frontend, which makes
+// the direct-play/remux/unsupported decision with canPlayType()
+type ProbeResult struct {
+	Container string        `json:"container"`
+	Duration  float64       `json:"duration"`
+	Streams   []ProbeStream `json:"streams"`
 }
 
 type Settings struct {
@@ -129,6 +157,82 @@ func (b *ringLogBuffer) Lines() []string {
 
 var logBuffer = &ringLogBuffer{max: 500}
 
+// ---- ffmpeg integration (issues #9, #12, #23) ----
+
+var (
+	serverPort      = 3347
+	ffmpegPath      string
+	ffprobePath     string
+	ffmpegAvailable bool
+	ffmpegVersion   string
+	remuxSlots      chan struct{}
+	// Authorization header ffmpeg/ffprobe send on loopback stream reads
+	// when basic auth is enabled
+	loopbackAuthHeader string
+)
+
+// checkFFmpeg detects ffmpeg/ffprobe at startup; without them the remux and
+// probe endpoints report 501 and the frontend falls back to direct playback
+func checkFFmpeg() {
+	maxRemux := 3
+	if v, err := strconv.Atoi(os.Getenv("BITPLAY_MAX_REMUX")); err == nil && v > 0 {
+		maxRemux = v
+	}
+	remuxSlots = make(chan struct{}, maxRemux)
+
+	var err error
+	ffmpegPath, err = exec.LookPath("ffmpeg")
+	if err != nil {
+		log.Println("ffmpeg not found in PATH - MKV remuxing and audio track selection disabled")
+		return
+	}
+	ffprobePath, err = exec.LookPath("ffprobe")
+	if err != nil {
+		log.Println("ffprobe not found in PATH - MKV remuxing and audio track selection disabled")
+		return
+	}
+	if out, verr := exec.Command(ffmpegPath, "-version").Output(); verr == nil {
+		fields := strings.Fields(strings.SplitN(string(out), "\n", 2)[0])
+		if len(fields) >= 3 {
+			ffmpegVersion = fields[2]
+		}
+	}
+	ffmpegAvailable = true
+	log.Printf("ffmpeg %s detected - remuxing enabled (max %d concurrent, BITPLAY_MAX_REMUX to change)", ffmpegVersion, maxRemux)
+}
+
+func capabilitiesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"ffmpeg":  ffmpegAvailable,
+		"version": ffmpegVersion,
+	})
+}
+
+// loopbackStreamURL lets ffmpeg read a torrent file through the existing
+// stream endpoint: the input is seekable (range requests -> Reader.Seek),
+// so MKV cues and moov-at-end MP4s work, and anacrolix prioritizes exactly
+// the pieces ffmpeg asks for - partially-downloaded files stream for free
+func loopbackStreamURL(sessionID string, fileIndex int) string {
+	return fmt.Sprintf("http://127.0.0.1:%d/api/v1/torrent/%s/stream/%d", serverPort, sessionID, fileIndex)
+}
+
+// limitedWriter keeps the head of ffmpeg's stderr for error logs
+type limitedWriter struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	if l.buf.Len() < l.max {
+		l.buf.Write(p[:min(len(p), l.max-l.buf.Len())])
+	}
+	return len(p), nil
+}
+
 // Helper function to format file sizes
 func formatSize(sizeInBytes float64) string {
 	if sizeInBytes < 1024 {
@@ -169,6 +273,8 @@ func basicAuthMiddleware(next http.Handler) http.Handler {
 	// Compare digests so timing doesn't leak length or content
 	userHash := sha256.Sum256([]byte(username))
 	passHash := sha256.Sum256([]byte(password))
+	// ffmpeg's loopback stream reads must authenticate like everyone else
+	loopbackAuthHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 	log.Println("Basic authentication enabled (BITPLAY_AUTH_USERNAME/BITPLAY_AUTH_PASSWORD)")
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -424,6 +530,9 @@ func main() {
 	// Keep recent log lines in memory for the diagnostics endpoint
 	log.SetOutput(io.MultiWriter(os.Stderr, logBuffer))
 
+	// Detect ffmpeg/ffprobe for the remux pipeline
+	checkFFmpeg()
+
 	// Seed random number generator
 	rand.Seed(time.Now().UnixNano())
 
@@ -464,6 +573,7 @@ func main() {
 	http.HandleFunc("/api/v1/logs", logsHandler)
 	http.HandleFunc("/api/v1/sessions", sessionsHandler)
 	http.HandleFunc("/api/v1/cache/purge", purgeCacheHandler)
+	http.HandleFunc("/api/v1/capabilities", capabilitiesHandler)
 
 	// Set up client file serving
 	// no-cache = browsers revalidate on every load (cheap 304s), so users
@@ -482,9 +592,7 @@ func main() {
 
 	go cleanupSessions()
 
-	port := 3347
-
-	addr := fmt.Sprintf(":%d", port)
+	addr := fmt.Sprintf(":%d", serverPort)
 	log.Printf("Attempting to start server on %s", addr)
 
 	// Create channel to signal if server started successfully
@@ -520,7 +628,7 @@ func main() {
 		// Create a simple message to display in the browser
 		fmt.Printf("\n------------------------------------------------\n")
 		fmt.Printf("✅ Server started! Open in your browser:\n")
-		fmt.Printf("   http://localhost:%d\n", port)
+		fmt.Printf("   http://localhost:%d\n", serverPort)
 		fmt.Printf("------------------------------------------------\n\n")
 
 		// Block forever (the server is running in a goroutine)
@@ -664,10 +772,11 @@ func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
 	sessionID := t.InfoHash().HexString()
 	log.Printf("Creating new session with ID: %s", sessionID)
 	sessions.Store(sessionID, &TorrentSession{
-		Client:   client,
-		Torrent:  t,
-		Port:     port,
-		LastUsed: time.Now(),
+		Client:     client,
+		Torrent:    t,
+		Port:       port,
+		LastUsed:   time.Now(),
+		ProbeCache: map[int]*ProbeResult{},
 	})
 
 	// Log successful storage
@@ -735,6 +844,16 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "Torrent metadata not available yet",
 		})
+		return
+	}
+
+	// Codec probe and ffmpeg remux endpoints
+	if len(parts) > 6 && parts[5] == "probe" {
+		handleProbe(w, r, session, sessionID, parts[6])
+		return
+	}
+	if len(parts) > 6 && parts[5] == "remux" {
+		handleRemux(w, r, session, sessionID, parts[6])
 		return
 	}
 
@@ -823,6 +942,10 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 				closer.Close()
 			}
 		}()
+		// A browser can hold one streaming response open for a long time
+		// without issuing new requests; keep the session off the idle GC
+		atomic.AddInt32(&session.ActiveStreams, 1)
+		defer atomic.AddInt32(&session.ActiveStreams, -1)
 		http.ServeContent(w, r, fileName, time.Time{}, reader)
 		return
 	}
@@ -894,6 +1017,13 @@ func cleanupSessions() {
 		sessions.Range(func(key, value interface{}) bool {
 			session := value.(*TorrentSession)
 
+			// A stream response can stay open far longer than the idle
+			// window without issuing new requests - never reap those
+			if atomic.LoadInt32(&session.ActiveStreams) > 0 {
+				session.LastUsed = time.Now()
+				return true
+			}
+
 			if time.Since(session.LastUsed) > 15*time.Minute {
 				teardownSession(key, session)
 				log.Printf("Removed unused session: %s", key)
@@ -901,6 +1031,231 @@ func cleanupSessions() {
 			return true
 		})
 		runtime.GC()
+	}
+}
+
+// runFFprobe analyzes the media file behind streamURL. On a fresh torrent
+// the header pieces may not be local yet - reads block until they arrive,
+// hence the generous timeout.
+func runFFprobe(ctx context.Context, streamURL string) (*ProbeResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	args := []string{"-v", "error", "-of", "json", "-show_format", "-show_streams",
+		"-probesize", "16M", "-analyzeduration", "20M"}
+	if loopbackAuthHeader != "" {
+		args = append(args, "-headers", "Authorization: "+loopbackAuthHeader+"\r\n")
+	}
+	args = append(args, streamURL)
+
+	cmd := exec.CommandContext(ctx, ffprobePath, args...)
+	var stdout bytes.Buffer
+	stderr := &limitedWriter{max: 4096}
+	cmd.Stdout = &stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("ffprobe: %v (%s)", err, strings.TrimSpace(stderr.buf.String()))
+	}
+
+	var raw struct {
+		Format struct {
+			FormatName string `json:"format_name"`
+			Duration   string `json:"duration"`
+		} `json:"format"`
+		Streams []struct {
+			Index       int               `json:"index"`
+			CodecType   string            `json:"codec_type"`
+			CodecName   string            `json:"codec_name"`
+			Profile     string            `json:"profile"`
+			Channels    int               `json:"channels"`
+			Tags        map[string]string `json:"tags"`
+			Disposition struct {
+				Default int `json:"default"`
+			} `json:"disposition"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		return nil, fmt.Errorf("ffprobe output parse: %v", err)
+	}
+
+	result := &ProbeResult{Container: raw.Format.FormatName}
+	result.Duration, _ = strconv.ParseFloat(raw.Format.Duration, 64)
+	for _, s := range raw.Streams {
+		ps := ProbeStream{
+			Index:    s.Index,
+			Type:     s.CodecType,
+			Codec:    s.CodecName,
+			Profile:  s.Profile,
+			Channels: s.Channels,
+			Default:  s.Disposition.Default == 1,
+		}
+		if s.Tags != nil {
+			ps.Language = s.Tags["language"]
+			ps.Title = s.Tags["title"]
+		}
+		result.Streams = append(result.Streams, ps)
+	}
+	return result, nil
+}
+
+// handleProbe serves cached-or-fresh codec facts for one file in a session
+func handleProbe(w http.ResponseWriter, r *http.Request, session *TorrentSession, sessionID, indexStr string) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if !ffmpegAvailable {
+		respondWithJSON(w, http.StatusNotImplemented, map[string]string{"error": "ffmpeg is not installed on the server"})
+		return
+	}
+
+	fileIndex, err := strconv.Atoi(indexStr)
+	if err != nil || fileIndex < 0 || fileIndex >= len(session.Torrent.Files()) {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid file index"})
+		return
+	}
+
+	session.ProbeMu.Lock()
+	cached := session.ProbeCache[fileIndex]
+	session.ProbeMu.Unlock()
+	if cached != nil {
+		respondWithJSON(w, http.StatusOK, cached)
+		return
+	}
+
+	result, err := runFFprobe(r.Context(), loopbackStreamURL(sessionID, fileIndex))
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			respondWithJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "Timed out reading media metadata - the torrent may still be fetching its first pieces, retry shortly"})
+			return
+		}
+		log.Printf("Probe failed for session %s file %d: %v", sessionID, fileIndex, err)
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to analyze media file"})
+		return
+	}
+
+	session.ProbeMu.Lock()
+	if session.ProbeCache == nil {
+		session.ProbeCache = map[int]*ProbeResult{}
+	}
+	session.ProbeCache[fileIndex] = result
+	session.ProbeMu.Unlock()
+
+	respondWithJSON(w, http.StatusOK, result)
+}
+
+// handleRemux repackages a file into a progressive fragmented MP4 with
+// stream copy (no re-encoding): MKV/AVI containers whose codecs the browser
+// can decode become playable, and ?audio=N picks an audio track. ?t=S
+// restarts from an offset for seek support. A future transcode option would
+// swap -c copy for encoders right here with the same lifecycle.
+func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession, sessionID, indexStr string) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if !ffmpegAvailable {
+		respondWithJSON(w, http.StatusNotImplemented, map[string]string{"error": "ffmpeg is not installed on the server"})
+		return
+	}
+
+	fileIndex, err := strconv.Atoi(indexStr)
+	if err != nil || fileIndex < 0 || fileIndex >= len(session.Torrent.Files()) {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid file index"})
+		return
+	}
+
+	// Strictly numeric query params (they end up in the ffmpeg argv)
+	audioStream := -1
+	if a := r.URL.Query().Get("audio"); a != "" {
+		audioStream, err = strconv.Atoi(a)
+		if err != nil || audioStream < 0 || audioStream > 512 {
+			respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid audio stream index"})
+			return
+		}
+	}
+	startSeconds := 0.0
+	if t := r.URL.Query().Get("t"); t != "" {
+		startSeconds, err = strconv.ParseFloat(t, 64)
+		if err != nil || startSeconds < 0 || startSeconds > 360000 {
+			respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid start time"})
+			return
+		}
+	}
+
+	// Bound concurrent ffmpeg processes
+	select {
+	case remuxSlots <- struct{}{}:
+		defer func() { <-remuxSlots }()
+	default:
+		respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Too many active streams - try again shortly"})
+		return
+	}
+
+	atomic.AddInt32(&session.ActiveStreams, 1)
+	defer atomic.AddInt32(&session.ActiveStreams, -1)
+
+	// The probe tells us whether the video is HEVC (needs the hvc1 tag or
+	// Safari refuses the remuxed fMP4)
+	videoCodec := ""
+	session.ProbeMu.Lock()
+	if probe := session.ProbeCache[fileIndex]; probe != nil {
+		for _, s := range probe.Streams {
+			if s.Type == "video" {
+				videoCodec = s.Codec
+				break
+			}
+		}
+	}
+	session.ProbeMu.Unlock()
+
+	args := []string{"-v", "error"}
+	if loopbackAuthHeader != "" {
+		args = append(args, "-headers", "Authorization: "+loopbackAuthHeader+"\r\n")
+	}
+	if startSeconds > 0 {
+		// -ss before -i seeks via container cues on the seekable input
+		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
+	}
+	args = append(args, "-i", loopbackStreamURL(sessionID, fileIndex), "-map", "0:v:0")
+	if audioStream >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:%d", audioStream))
+	} else {
+		args = append(args, "-map", "0:a:0?")
+	}
+	args = append(args, "-c", "copy", "-sn")
+	if videoCodec == "hevc" {
+		args = append(args, "-tag:v", "hvc1")
+	}
+	args = append(args,
+		"-avoid_negative_ts", "make_zero",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4", "pipe:1",
+	)
+
+	// Client disconnect cancels the request context, which kills ffmpeg;
+	// WaitDelay escalates to SIGKILL if it lingers
+	cmd := exec.CommandContext(r.Context(), ffmpegPath, args...)
+	cmd.WaitDelay = 3 * time.Second
+	stderr := &limitedWriter{max: 4096}
+	cmd.Stderr = stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to start remux"})
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to start ffmpeg"})
+		return
+	}
+	log.Printf("Remux started for session %s file %d (audio=%d t=%.1f)", sessionID, fileIndex, audioStream, startSeconds)
+
+	// Chunked progressive fMP4: no byte-range seeking on this response,
+	// the frontend restarts with ?t= instead
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Accept-Ranges", "none")
+	w.Header().Set("Cache-Control", "no-store")
+	io.Copy(w, stdout)
+
+	if err := cmd.Wait(); err != nil && r.Context().Err() == nil {
+		log.Printf("ffmpeg remux for session %s file %d exited: %v (%s)", sessionID, fileIndex, err, strings.TrimSpace(stderr.buf.String()))
 	}
 }
 

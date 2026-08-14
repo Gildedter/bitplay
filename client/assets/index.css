@@ -399,6 +399,13 @@ body .video-js .vjs-big-play-button .vjs-icon-placeholder:before {
   display: block;
 }
 
+/* Audio-track picker sits opposite the video picker */
+.audio-select {
+  left: auto;
+  right: 13px;
+  max-width: 45%;
+}
+
 .video-js .vjs-progress-holder {
   height: 6px;
   transition: 0.3s all;

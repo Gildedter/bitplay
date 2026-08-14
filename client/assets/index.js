@@ -88,6 +88,296 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     startPlayback();
   });
 
+  // ---- Playback compatibility (issues #9, #12, #23) ----
+  // The server probes files with ffprobe and remuxes MKV/AVI into
+  // fragmented MP4 with stream copy; the browser decides direct vs remux
+  // vs unsupported here, because only it knows what it can decode.
+
+  const MIME_BY_EXT = {
+    mp4: "video/mp4",
+    m4v: "video/mp4",
+    webm: "video/webm",
+    mkv: "video/x-matroska",
+    avi: "video/x-msvideo",
+  };
+  const guessMime = (name) =>
+    MIME_BY_EXT[name.split(".").pop().toLowerCase()] || "video/mp4";
+
+  let capabilitiesCache = null;
+  const getCapabilities = async () => {
+    if (!capabilitiesCache) {
+      capabilitiesCache = await fetch("/api/v1/capabilities")
+        .then((r) => r.json())
+        .catch(() => ({ ffmpeg: false }));
+    }
+    return capabilitiesCache;
+  };
+
+  // Representative MIME strings per probed codec; canPlayType has the
+  // final say. Codecs missing here are treated as undecodable.
+  const CODEC_TYPES = {
+    h264: 'video/mp4; codecs="avc1.640029"',
+    hevc: 'video/mp4; codecs="hvc1.1.6.L123.B0"',
+    av1: 'video/mp4; codecs="av01.0.08M.08"',
+    vp8: 'video/webm; codecs="vp8"',
+    vp9: 'video/webm; codecs="vp09.00.40.08"',
+    aac: 'audio/mp4; codecs="mp4a.40.2"',
+    mp3: "audio/mpeg",
+    flac: 'audio/mp4; codecs="flac"',
+    opus: 'audio/webm; codecs="opus"',
+    vorbis: 'audio/webm; codecs="vorbis"',
+    ac3: 'audio/mp4; codecs="ac-3"',
+    eac3: 'audio/mp4; codecs="ec-3"',
+  };
+  const codecProbeEl = document.createElement("video");
+  const canDecode = (codec) => {
+    const type = CODEC_TYPES[codec];
+    return type ? codecProbeEl.canPlayType(type) !== "" : false;
+  };
+
+  // Decide how to play one torrent file. Returns {mode, src, type, ...}:
+  // direct (untouched fast path), remux (ffmpeg repackage), or
+  // unsupported (browser can't decode the video codec at all).
+  const pickSource = async (sessionId, file) => {
+    const directUrl = "/api/v1/torrent/" + sessionId + "/stream/" + file.index;
+    const ext = file.name.split(".").pop().toLowerCase();
+    const fallback = {
+      mode: "direct",
+      src: directUrl,
+      type: guessMime(file.name),
+      directUrl,
+      probe: null,
+    };
+
+    const caps = await getCapabilities();
+    if (!caps.ffmpeg) {
+      return fallback;
+    }
+
+    let probe = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await fetch(
+        `/api/v1/torrent/${sessionId}/probe/${file.index}`
+      ).catch(() => null);
+      if (res && res.ok) {
+        probe = await res.json();
+        break;
+      }
+      if (!res || res.status !== 504) {
+        break; // only the "pieces not here yet" timeout is worth retrying
+      }
+    }
+    if (!probe) {
+      return fallback; // never worse than the old behavior
+    }
+
+    const video = probe.streams.find((s) => s.type === "video");
+    const audios = probe.streams.filter((s) => s.type === "audio");
+    const defaultAudio = audios.find((a) => a.default) || audios[0];
+    if (!video) {
+      return fallback;
+    }
+
+    const videoOk = canDecode(video.codec);
+    const audioOk = !defaultAudio || canDecode(defaultAudio.codec);
+    const nativeContainer = ext === "mp4" || ext === "m4v" || ext === "webm";
+
+    if (!videoOk) {
+      return { mode: "unsupported", probe, video, directUrl };
+    }
+    if (nativeContainer && audioOk) {
+      return { ...fallback, probe };
+    }
+
+    // Browser-friendly codecs in a container it can't demux -> remux
+    const remuxUrl = (opts = {}) => {
+      const params = new URLSearchParams();
+      if (opts.audio != null) params.set("audio", opts.audio);
+      if (opts.t) params.set("t", opts.t.toFixed(3));
+      const qs = params.toString();
+      return (
+        "/api/v1/torrent/" +
+        sessionId +
+        "/remux/" +
+        file.index +
+        (qs ? "?" + qs : "")
+      );
+    };
+    const currentAudio = defaultAudio ? defaultAudio.index : null;
+    return {
+      mode: "remux",
+      src: remuxUrl({ audio: currentAudio }),
+      type: "video/mp4",
+      probe,
+      video,
+      audios,
+      remuxUrl,
+      directUrl,
+      currentAudio,
+      audioWarning: !audioOk,
+      audioCodec: defaultAudio ? defaultAudio.codec : null,
+    };
+  };
+
+  const removeExternalPanel = () => {
+    const panel = document.querySelector("#external-player-panel");
+    if (panel) {
+      panel.remove();
+    }
+  };
+
+  // Honest fallback for files the browser truly can't play: hand the user
+  // the direct stream URL, which VLC/mpv play natively
+  const showExternalPanel = (chosen) => {
+    removeExternalPanel();
+    const absUrl = new URL(chosen.directUrl, location.href).href;
+
+    const panel = document.createElement("div");
+    panel.id = "external-player-panel";
+    panel.className = "w-full mt-6 border rounded-lg p-4 flex flex-col gap-3";
+
+    const msg = document.createElement("p");
+    msg.className = "text-sm text-muted-foreground";
+    const codec = chosen.video ? chosen.video.codec.toUpperCase() : "an unknown codec";
+    msg.textContent =
+      `This video is ${codec}` +
+      `${chosen.video && chosen.video.profile ? " (" + chosen.video.profile + ")" : ""}` +
+      ", which this browser can't decode. Play it in an external player instead — VLC and mpv handle it natively.";
+
+    const row = document.createElement("div");
+    row.className = "flex flex-wrap gap-2";
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "btn small";
+    copyBtn.textContent = "Copy stream URL";
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(absUrl).then(() => {
+        butterup.toast({
+          message:
+            "Stream URL copied — in VLC use Media → Open Network Stream",
+          location: "top-right",
+          icon: true,
+          dismissable: true,
+          type: "success",
+        });
+      });
+    });
+
+    const vlcLink = document.createElement("a");
+    vlcLink.className = "btn small";
+    vlcLink.textContent = "Open in VLC";
+    vlcLink.href = "vlc://" + absUrl;
+
+    row.append(copyBtn, vlcLink);
+    panel.append(msg, row);
+    document.querySelector("main").appendChild(panel);
+    panel.scrollIntoView({ behavior: "smooth" });
+  };
+
+  // Remux streams are chunked fMP4: no byte-range seeking. Report the
+  // probed duration, translate timeline positions by the stream's start
+  // offset, and restart ffmpeg with ?t= for out-of-buffer seeks.
+  const attachRemuxPlayback = (chosen) => {
+    if (!player.__origCurrentTime) {
+      player.__origCurrentTime = player.currentTime.bind(player);
+      player.__origDuration = player.duration.bind(player);
+    }
+    let offset = 0;
+    let seekTimer = null;
+    const total = (chosen.probe && chosen.probe.duration) || 0;
+
+    const reload = (t) => {
+      offset = t || 0;
+      player.src({
+        src: chosen.remuxUrl({
+          audio: chosen.currentAudio,
+          t: offset || undefined,
+        }),
+        type: "video/mp4",
+      });
+      player.one("loadedmetadata", () => player.trigger("durationchange"));
+      player.play();
+    };
+    chosen.reload = reload;
+    chosen.getAbsoluteTime = () => offset + (player.__origCurrentTime() || 0);
+
+    player.duration = () => total || player.__origDuration();
+    player.currentTime = (t) => {
+      if (t === undefined) {
+        return offset + (player.__origCurrentTime() || 0);
+      }
+      const target = Math.max(0, total ? Math.min(t, total - 0.5) : t);
+      const local = target - offset;
+      const buffered = player.buffered();
+      const bufferedEnd =
+        buffered && buffered.length ? buffered.end(buffered.length - 1) : 0;
+      if (local >= 0 && local <= bufferedEnd) {
+        player.__origCurrentTime(local);
+      } else {
+        // Restart from the target position (debounced against seek storms)
+        clearTimeout(seekTimer);
+        seekTimer = setTimeout(() => reload(target), 400);
+      }
+      return player;
+    };
+  };
+
+  const buildAudioSelect = (chosen) => {
+    const select = document.createElement("select");
+    select.id = "audio-select";
+    select.className = "video-select audio-select";
+    select.setAttribute("aria-label", "Select audio track");
+    chosen.audios.forEach((a) => {
+      const option = document.createElement("option");
+      option.value = String(a.index);
+      const lang =
+        a.language && a.language !== "und" ? getLanguage(a.language) : null;
+      const name = a.title || lang || `Track ${a.index}`;
+      const detail = a.codec + (a.channels ? ` ${a.channels}ch` : "");
+      option.textContent = `${name} (${detail})`;
+      select.appendChild(option);
+    });
+    select.value = String(chosen.currentAudio);
+    select.addEventListener("change", () => {
+      const resumeAt = chosen.getAbsoluteTime ? chosen.getAbsoluteTime() : 0;
+      chosen.currentAudio = parseInt(select.value, 10);
+      if (chosen.reload) {
+        chosen.reload(resumeAt);
+      }
+    });
+    document.querySelector("#video-player").appendChild(select);
+  };
+
+  // Wire everything a chosen source needs after the player exists
+  const setupChosenPlayback = (chosen) => {
+    const oldAudioSelect = document.querySelector("#audio-select");
+    if (oldAudioSelect) {
+      oldAudioSelect.remove();
+    }
+    removeExternalPanel();
+
+    if (chosen.mode === "remux") {
+      attachRemuxPlayback(chosen);
+      if (chosen.audios && chosen.audios.length > 1) {
+        buildAudioSelect(chosen);
+      }
+      if (chosen.audioWarning) {
+        butterup.toast({
+          message: `The ${(chosen.audioCodec || "").toUpperCase()} audio track can't be decoded by this browser, so the video may play silently. Use an external player for sound.`,
+          location: "top-right",
+          icon: true,
+          dismissable: true,
+          type: "info",
+        });
+      }
+    } else if (player.__origCurrentTime) {
+      // Back on a direct source: restore the untouched player methods
+      delete player.currentTime;
+      delete player.duration;
+    }
+  };
+
   // Named function instead of dispatching synthetic "submit" events: a
   // scripted Event("submit") is non-cancelable, so preventDefault() was a
   // no-op in Firefox and the browser performed a real form submission,
@@ -202,14 +492,6 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       f.name.match(/\.(srt|vtt|sub)$/i)
     );
 
-    const videoUrls = videoFiles.map((file) => {
-      return {
-        src: "/api/v1/torrent/" + sessionId + "/stream/" + file.index,
-        title: file.name,
-        type: "video/mp4",
-      };
-    });
-
     let subtitles = [];
     if (subtitleFiles.length) {
       subtitles = subtitleFiles.map((subFile) => {
@@ -237,6 +519,22 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         };
       });
     }
+    // Probe the file and pick direct play, remux, or honest failure
+    const chosen = await pickSource(sessionId, videoFiles[0]);
+
+    if (chosen.mode === "unsupported") {
+      showExternalPanel(chosen);
+      form.querySelector("button[type=submit]").removeAttribute("disabled");
+      form.querySelector("button[type=submit]").innerHTML = "Play Now";
+      form.querySelector("button[type=submit]").classList.remove("loader");
+      document.querySelectorAll(".play-torrent").forEach((el) => {
+        el.removeAttribute("disabled");
+        el.innerHTML = "Watch";
+        el.classList.remove("loader");
+      });
+      return;
+    }
+
     player = videojs(
       "video-player",
       {
@@ -245,9 +543,9 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         autoplay: true,
         preload: "auto",
         sources: [{
-          src: videoUrls[0].src,
-          type: videoUrls[0].type,
-          label: videoUrls[0].title,
+          src: chosen.src,
+          type: chosen.type,
+          label: videoFiles[0].name,
         }],
         tracks: subtitles,
         html5: {
@@ -267,10 +565,13 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         player.on("error", () => {
           const mediaError = player.error();
           console.error(mediaError);
+          const codecName = chosen.video
+            ? chosen.video.codec.toUpperCase() + " video"
+            : "this video's codec";
           const messages = {
             1: "Video loading was aborted",
             2: "Network error while fetching the video stream",
-            3: "Your browser could not decode this video's codec",
+            3: `Your browser could not decode ${codecName}`,
             4: "This video format is not supported by your browser",
           };
           butterup.toast({
@@ -283,10 +584,16 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
             dismissable: true,
             type: "error",
           });
+          // Decode/format failures won't fix themselves - offer the
+          // external-player way out
+          if (mediaError && (mediaError.code === 3 || mediaError.code === 4)) {
+            showExternalPanel(chosen);
+          }
         });
       }
     );
     player.doubleTapFF();
+    setupChosenPlayback(chosen);
 
     document.querySelector("#video-player").style.display = "block";
 
@@ -304,23 +611,30 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         behavior: "smooth",
       });
 
-      if (videoUrls.length > 1) {
+      if (videoFiles.length > 1) {
         const videoSelect = document.createElement("select");
         videoSelect.setAttribute("id", "video-select");
         videoSelect.setAttribute("class", "video-select");
         videoSelect.setAttribute("aria-label", "Select video");
-        videoUrls.forEach((video) => {
+        videoFiles.forEach((file) => {
           const option = document.createElement("option");
-          option.setAttribute("value", video.src);
-          option.innerHTML = video.title;
+          option.setAttribute("value", String(file.index));
+          option.textContent = file.name;
           videoSelect.appendChild(option);
         });
-        videoSelect.addEventListener("change", (e) => {
-          const selectedSrc = e.target.value;
-          player.src({
-            src: selectedSrc,
-            type: "video/mp4",
-          });
+        videoSelect.value = String(videoFiles[0].index);
+        videoSelect.addEventListener("change", async (e) => {
+          const file = videoFiles.find(
+            (f) => f.index === parseInt(e.target.value, 10)
+          );
+          const next = await pickSource(sessionId, file);
+          if (next.mode === "unsupported") {
+            player.pause();
+            showExternalPanel(next);
+            return;
+          }
+          player.src({ src: next.src, type: next.type });
+          setupChosenPlayback(next);
           player.play();
         });
         document.querySelector("#video-player").appendChild(videoSelect);
