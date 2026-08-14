@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # Set working directory for the build
 WORKDIR /app
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o main .
 
 # Final stage
-FROM alpine:3.18
+FROM alpine:3.22
 RUN apk --no-cache add ca-certificates
 
 # ARG APP_VERSION, will be set during build by github actions
