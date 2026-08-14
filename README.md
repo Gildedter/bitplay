@@ -7,11 +7,14 @@ BitPlay is a web application built with Go that allows you to stream video conte
 ## Features
 
 *   **Direct Torrent Streaming:** Stream video files from magnet links or torrent files directly without needing to download them completely first.
+*   **MKV & Audio-Track Support:** Files the browser can't play natively (e.g. MKV) are remuxed on the fly with ffmpeg — no re-encoding — including an audio-track picker for multi-language files. Files with codecs your browser truly can't decode get a clear explanation plus one-click "Copy stream URL" / "Open in VLC" fallbacks.
 *   **Web-Based UI:** Access and control BitPlay through a user-friendly web interface.
 *   **Proxy Support:** Configure a SOCKS5 proxy for all torrent-related traffic (fetching metadata, peer connections). (Note: HTTP proxies are not currently supported).
 *   **Prowlarr Integration:** Connect to your Prowlarr instance to search across your configured indexers directly within BitPlay.
 *   **Jackett Integration:** Connect to your Jackett instance as an alternative search provider.
-*   **On-the-fly Subtitle Conversion:** Converts SRT subtitles to VTT format for browser compatibility.
+*   **Subtitles:** Embedded SRT subtitles are converted to VTT on the fly, and you can upload your own `.srt`/`.vtt` file during playback.
+*   **Optional Basic Auth:** Protect a publicly reachable instance with a username and password via environment variables.
+*   **Maintenance Tools:** A settings tab with live session stats, recent server logs, and a one-click cache purge that frees all downloaded data.
 *   **Session Management:** Handles multiple torrent sessions and cleans up inactive ones.
 
 ## Getting Started
@@ -20,7 +23,8 @@ You can run BitPlay either directly using Go or via Docker Compose.
 
 ### Prerequisites
 
-*   **Go:** Requires Go 1.18 or later (if running locally).
+*   **Go:** Requires Go 1.25 or later (if running locally).
+*   **ffmpeg:** Optional but recommended for local runs — it powers MKV remuxing and audio-track selection. Without it BitPlay still works, minus those features. (The Docker image ships with ffmpeg included.)
 *   **Docker & Docker Compose:** Required if running with Docker.
 
 ### Running Locally with Go
@@ -110,8 +114,62 @@ BitPlay is configured primarily through its web interface after starting the app
     *   **Proxy:** Enable/disable proxy support and provide the full SOCKS5 proxy URL (e.g., `socks5://user:pass@host:port`). Test the connection using the provided button.
     *   **Prowlarr:** Enable/disable Prowlarr, provide the Prowlarr Host URL (e.g., `http://prowlarr:9696`), and your Prowlarr API Key. Test the connection.
     *   **Jackett:** Enable/disable Jackett, provide the Jackett Host URL (e.g., `http://jackett:9117`), and your Jackett API Key. Test the connection.
+    *   **Search Timeout / TLS:** Both indexer tabs also let you raise the search timeout (default 30s — useful for Jackett setups with many indexers) and skip TLS certificate verification for self-signed Prowlarr/Jackett instances.
+    *   **Maintenance:** The fourth settings tab shows active torrent sessions, recent server logs, and a **Purge Cache** button that stops all sessions and deletes everything downloaded to disk.
 
-Settings are saved automatically to `/app/config/settings.json` inside the Docker container, which maps to `./config/settings.json` on the host via the mounted volume in the example Docker Compose setup above.
+Settings are saved automatically to `/app/config/settings.json` inside the Docker container, which maps to `./config/settings.json` on the host via the mounted volume in the example Docker Compose setup above. API keys are never sent back to the browser once saved.
+
+### Environment Variables
+
+| Variable | Description |
+| --- | --- |
+| `BITPLAY_AUTH_USERNAME` / `BITPLAY_AUTH_PASSWORD` | Set both to protect the entire app (UI, API, and video streams) with HTTP basic auth. Recommended for instances exposed to the internet. |
+| `BITPLAY_MAX_REMUX` | Maximum concurrent ffmpeg remux streams (default `3`). |
+
+Example with Docker Compose:
+
+```yaml
+services:
+  bitplay:
+    image: ghcr.io/aculix/bitplay:main
+    ports:
+      - 3347:3347
+    environment:
+      - BITPLAY_AUTH_USERNAME=admin
+      - BITPLAY_AUTH_PASSWORD=change-me
+    restart: unless-stopped
+```
+
+### Routing Through a VPN with Gluetun
+
+If you want all of BitPlay's traffic (not just torrent traffic) forced through a VPN, run it behind [gluetun](https://github.com/qdm12/gluetun) and attach BitPlay to gluetun's network:
+
+```yaml
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - 3347:3347 # BitPlay's UI is published via gluetun
+    environment:
+      - VPN_SERVICE_PROVIDER=your-provider
+      # See gluetun's docs for your provider's credentials/variables
+    restart: unless-stopped
+
+  bitplay:
+    image: ghcr.io/aculix/bitplay:main
+    container_name: bitplay
+    network_mode: service:gluetun
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
+```
+
+With `network_mode: service:gluetun`, every connection BitPlay makes — trackers, peers, DHT — goes through the VPN tunnel, and the UI is reached through gluetun's published port. Alternatively, BitPlay's built-in SOCKS5 proxy setting covers torrent traffic only.
 
 ## Usage
 
