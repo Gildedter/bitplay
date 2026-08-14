@@ -327,8 +327,18 @@ func main() {
 	http.HandleFunc("/api/v1/settings", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			settingsMutex.RLock()
-			defer settingsMutex.RUnlock()
-			respondWithJSON(w, http.StatusOK, currentSettings)
+			snapshot := currentSettings
+			settingsMutex.RUnlock()
+
+			// Never expose API keys; the client only needs to know whether one is stored
+			resp := struct {
+				Settings
+				ProwlarrApiKeySet bool `json:"prowlarrApiKeySet"`
+				JackettApiKeySet  bool `json:"jackettApiKeySet"`
+			}{snapshot, snapshot.ProwlarrApiKey != "", snapshot.JackettApiKey != ""}
+			resp.ProwlarrApiKey = ""
+			resp.JackettApiKey = ""
+			respondWithJSON(w, http.StatusOK, resp)
 		} else {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -795,6 +805,13 @@ func testProwlarrConnection(w http.ResponseWriter, r *http.Request) {
 	prowlarrHost := settings.ProwlarrHost
 	prowlarrApiKey := settings.ProwlarrApiKey
 
+	// The UI never sees stored keys, so an empty key means "test with the stored one"
+	if prowlarrApiKey == "" {
+		settingsMutex.RLock()
+		prowlarrApiKey = currentSettings.ProwlarrApiKey
+		settingsMutex.RUnlock()
+	}
+
 	if prowlarrHost == "" || prowlarrApiKey == "" {
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Prowlarr host or API key not set"})
 		return
@@ -995,6 +1012,13 @@ func testJackettConnection(w http.ResponseWriter, r *http.Request) {
 
 	jackettHost := settings.JackettHost
 	jackettApiKey := settings.JackettApiKey
+
+	// The UI never sees stored keys, so an empty key means "test with the stored one"
+	if jackettApiKey == "" {
+		settingsMutex.RLock()
+		jackettApiKey = currentSettings.JackettApiKey
+		settingsMutex.RUnlock()
+	}
 
 	if jackettHost == "" || jackettApiKey == "" {
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Jackett host or API key not set"})
@@ -1256,15 +1280,24 @@ func saveSettingsToFile() error {
 		log.Fatalf("Failed to create config directory: %v", err)
 	}
 
-	file, err := os.Create("config/settings.json")
+	settingsMutex.RLock()
+	snapshot := currentSettings
+	settingsMutex.RUnlock()
+
+	// 0600: the file contains API keys
+	file, err := os.OpenFile("config/settings.json", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	// Tighten pre-existing files too (mode above only applies on creation)
+	if err := file.Chmod(0600); err != nil {
+		log.Printf("Warning: could not chmod settings.json: %v", err)
+	}
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(currentSettings); err != nil {
+	if err := encoder.Encode(snapshot); err != nil {
 		return err
 	}
 
@@ -1289,10 +1322,10 @@ func saveProxySettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	settingsMutex.RLock()
+	settingsMutex.Lock()
 	currentSettings.EnableProxy = newSettings.EnableProxy
 	currentSettings.ProxyURL = newSettings.ProxyURL
-	defer settingsMutex.RUnlock()
+	settingsMutex.Unlock()
 
 	if err := saveSettingsToFile(); err != nil {
 		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to save settings: " + err.Error()})
@@ -1323,11 +1356,14 @@ func saveProwlarrSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	settingsMutex.RLock()
+	settingsMutex.Lock()
 	currentSettings.EnableProwlarr = newSettings.EnableProwlarr
 	currentSettings.ProwlarrHost = newSettings.ProwlarrHost
-	currentSettings.ProwlarrApiKey = newSettings.ProwlarrApiKey
-	defer settingsMutex.RUnlock()
+	// Empty key means "keep the stored one" (the UI never sees the real key)
+	if newSettings.ProwlarrApiKey != "" {
+		currentSettings.ProwlarrApiKey = newSettings.ProwlarrApiKey
+	}
+	settingsMutex.Unlock()
 
 	if err := saveSettingsToFile(); err != nil {
 		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to save settings: " + err.Error()})
@@ -1355,11 +1391,14 @@ func saveJackettSettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	settingsMutex.RLock()
+	settingsMutex.Lock()
 	currentSettings.EnableJackett = newSettings.EnableJackett
 	currentSettings.JackettHost = newSettings.JackettHost
-	currentSettings.JackettApiKey = newSettings.JackettApiKey
-	defer settingsMutex.RUnlock()
+	// Empty key means "keep the stored one" (the UI never sees the real key)
+	if newSettings.JackettApiKey != "" {
+		currentSettings.JackettApiKey = newSettings.JackettApiKey
+	}
+	settingsMutex.Unlock()
 
 	if err := saveSettingsToFile(); err != nil {
 		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to save settings: " + err.Error()})

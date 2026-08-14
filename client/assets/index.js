@@ -548,7 +548,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     const prowlarrApiKey = document.querySelector("#prowlarrApiKey").value;
     const prowlarrTestBtn = document.querySelector("#test-prowlarr");
 
-    if (!prowlarrHost || !prowlarrApiKey) {
+    // Empty key is fine when one is already saved server-side
+    if (!prowlarrHost || (!prowlarrApiKey && !settings?.prowlarrApiKeySet)) {
       butterup.toast({
         message: "Please enter Prowlarr host and API key",
         location: "top-right",
@@ -605,7 +606,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     const jackettApiKey = document.querySelector("#jackettApiKey").value;
     const jackettTestBtn = document.querySelector("#test-jackett");
 
-    if (!jackettHost || !jackettApiKey) {
+    // Empty key is fine when one is already saved server-side
+    if (!jackettHost || (!jackettApiKey && !settings?.jackettApiKeySet)) {
       butterup.toast({
         message: "Please enter Jackett host and API key",
         location: "top-right",
@@ -839,8 +841,15 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
           ...settings,
           enableProwlarr: body.enableProwlarr,
           prowlarrHost: body.prowlarrHost,
-          prowlarrApiKey: body.prowlarrApiKey,
+          prowlarrApiKeySet:
+            !!body.prowlarrApiKey || settings?.prowlarrApiKeySet,
         };
+
+        const prowlarrKeyInput = document.querySelector("#prowlarrApiKey");
+        prowlarrKeyInput.value = "";
+        if (settings.prowlarrApiKeySet) {
+          prowlarrKeyInput.placeholder = "Saved — leave blank to keep";
+        }
 
         // Check if Prowlarr or Jackett is enabled
         if (body?.enableProwlarr || settings?.enableJackett) {
@@ -911,11 +920,17 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         ...settings,
         enableJackett: body.enableJackett,
         jackettHost: body.jackettHost,
-        jackettApiKey: body.jackettApiKey,
+        jackettApiKeySet: !!body.jackettApiKey || settings?.jackettApiKeySet,
       };
 
-      // Check if Jackett or Jackett is enabled
-      if (body?.enableJackett || settings?.enableJackett) {
+      const jackettKeyInput = document.querySelector("#jackettApiKey");
+      jackettKeyInput.value = "";
+      if (settings.jackettApiKeySet) {
+        jackettKeyInput.placeholder = "Saved — leave blank to keep";
+      }
+
+      // Check if Prowlarr or Jackett is enabled
+      if (body?.enableJackett || settings?.enableProwlarr) {
         searchWrapper.classList.remove("hidden");
       } else {
         searchWrapper.classList.add("hidden");
@@ -1046,12 +1061,22 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       document.querySelector("#enableProwlarr").checked =
         data.enableProwlarr || false;
       document.querySelector("#prowlarrHost").value = data.prowlarrHost || "";
-      document.querySelector("#prowlarrApiKey").value =
-        data.prowlarrApiKey || "";
       document.querySelector("#enableJackett").checked =
         data.enableJackett || false;
       document.querySelector("#jackettHost").value = data.jackettHost || "";
-      document.querySelector("#jackettApiKey").value = data.jackettApiKey || "";
+
+      // The server never returns stored API keys; show a hint instead and
+      // leave the field blank ("blank" = keep the saved key on save/test)
+      const prowlarrKeyInput = document.querySelector("#prowlarrApiKey");
+      prowlarrKeyInput.value = "";
+      prowlarrKeyInput.placeholder = data.prowlarrApiKeySet
+        ? "Saved — leave blank to keep"
+        : "Your Prowlarr API key";
+      const jackettKeyInput = document.querySelector("#jackettApiKey");
+      jackettKeyInput.value = "";
+      jackettKeyInput.placeholder = data.jackettApiKeySet
+        ? "Saved — leave blank to keep"
+        : "Your Jackett API key";
 
       // Set switch button state
       const switchInputs = document.querySelectorAll("#switchInput");
