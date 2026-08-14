@@ -529,6 +529,7 @@ func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Successfully got torrent info for %s", t.InfoHash().HexString())
 	case <-time.After(3 * time.Minute):
 		respondWithJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "Timeout getting info - proxy might be blocking BitTorrent traffic"})
+		return
 	}
 
 	sessionID := t.InfoHash().HexString()
@@ -599,6 +600,14 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Found session with ID: %s", sessionID)
 	session := sessionValue.(*TorrentSession)
 	session.LastUsed = time.Now() // Update last used time
+
+	// Guard against sessions whose metadata never arrived; Files() panics without info
+	if session.Torrent.Info() == nil {
+		respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "Torrent metadata not available yet",
+		})
+		return
+	}
 
 	// If there's a streaming request, handle it
 	if len(parts) > 5 && parts[5] == "stream" { // Changed from parts[4] to parts[5]
