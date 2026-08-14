@@ -52,7 +52,7 @@ This is the recommended method for deployment.
     ```yaml
     services:
       bitplay:
-        image: ghcr.io/aculix/bitplay:main
+        image: ghcr.io/aculix/bitplay:latest
         container_name: bitplay
         ports:
           - 3347:3347 # Expose the web UI port
@@ -93,14 +93,14 @@ Alternatively, you can run the container directly using `docker run`:
       # The location where the downloaded file is saved
       -v $(pwd)/torrent-data:/app/torrent-data \
       --restart unless-stopped \
-      ghcr.io/aculix/bitplay:main
+      ghcr.io/aculix/bitplay:latest
     ```
     *   `-d`: Run in detached mode (background).
     *   `--name bitplay`: Assign a name to the container.
     *   `-p 3347:3347`: Map port 3347 on the host to port 3347 in the container.
     *   `-v $(pwd)/config:/app/config`: (Optional) Mount the local `./config` directory for persistent settings.
     *   `--restart unless-stopped`: Configure the container to restart automatically unless manually stopped.
-    *   `ghcr.io/aculix/bitplay:main`: The Docker image to use.
+    *   `ghcr.io/aculix/bitplay:latest`: The Docker image to use.
 
 3.  **Access the application:** Open your browser to `http://<your-server-ip>:3347`.
 
@@ -131,7 +131,7 @@ Example with Docker Compose:
 ```yaml
 services:
   bitplay:
-    image: ghcr.io/aculix/bitplay:main
+    image: ghcr.io/aculix/bitplay:latest
     ports:
       - 3347:3347
     environment:
@@ -161,7 +161,7 @@ services:
     restart: unless-stopped
 
   bitplay:
-    image: ghcr.io/aculix/bitplay:main
+    image: ghcr.io/aculix/bitplay:latest
     container_name: bitplay
     network_mode: service:gluetun
     volumes:
