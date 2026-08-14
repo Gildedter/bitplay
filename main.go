@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -122,6 +124,38 @@ var proxyTransport = &http.Transport{
 	ExpectContinueTimeout: 1 * time.Second,
 	IdleConnTimeout:       30 * time.Second,
 	MaxIdleConnsPerHost:   10,
+}
+
+// basicAuthMiddleware protects every route with HTTP basic auth when both
+// BITPLAY_AUTH_USERNAME and BITPLAY_AUTH_PASSWORD are set (issue #20, for
+// instances exposed to the public internet). With either unset it is a no-op.
+func basicAuthMiddleware(next http.Handler) http.Handler {
+	username := os.Getenv("BITPLAY_AUTH_USERNAME")
+	password := os.Getenv("BITPLAY_AUTH_PASSWORD")
+	if username == "" || password == "" {
+		return next
+	}
+
+	// Compare digests so timing doesn't leak length or content
+	userHash := sha256.Sum256([]byte(username))
+	passHash := sha256.Sum256([]byte(password))
+	log.Println("Basic authentication enabled (BITPLAY_AUTH_USERNAME/BITPLAY_AUTH_PASSWORD)")
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if ok {
+			uh := sha256.Sum256([]byte(user))
+			ph := sha256.Sum256([]byte(pass))
+			userMatch := subtle.ConstantTimeCompare(userHash[:], uh[:]) == 1
+			passMatch := subtle.ConstantTimeCompare(passHash[:], ph[:]) == 1
+			if userMatch && passMatch {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="BitPlay", charset="UTF-8"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	})
 }
 
 func copyHeadersOnRedirect(req *http.Request, via []*http.Request) error {
@@ -422,8 +456,9 @@ func main() {
 
 	// Create a server with graceful shutdown
 	server := &http.Server{
-		Addr:    addr,
-		Handler: nil, // Use the default ServeMux
+		Addr: addr,
+		// Optional basic auth wraps the whole app: UI, API, and streams
+		Handler: basicAuthMiddleware(http.DefaultServeMux),
 	}
 
 	// Start the server in a goroutine
