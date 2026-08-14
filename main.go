@@ -723,35 +723,39 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 
 // Add a function to convert SRT to VTT format
 func convertSRTtoVTT(srtBytes []byte) []byte {
-	srtContent := string(srtBytes)
+	// Strip UTF-8 BOM; a BOM after the WEBVTT header breaks cue parsing
+	srtBytes = bytes.TrimPrefix(srtBytes, []byte{0xEF, 0xBB, 0xBF})
+	srtContent := strings.ReplaceAll(string(srtBytes), "\r\n", "\n")
 
-	// Add VTT header
-	vttContent := "WEBVTT\n\n"
+	var vtt strings.Builder
+	vtt.WriteString("WEBVTT\n\n")
 
-	// Convert SRT content to VTT format
-	// Simple conversion - replace timestamps format
-	lines := strings.Split(srtContent, "\n")
-
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-
-		// Skip subtitle numbers
-		if _, err := strconv.Atoi(strings.TrimSpace(line)); err == nil {
+	// SRT cues are blank-line separated: sequence number, timestamps, text.
+	// Only drop the leading sequence number of each cue so numeric caption
+	// text survives, and only rewrite commas on the timestamp line.
+	for _, block := range strings.Split(srtContent, "\n\n") {
+		lines := strings.Split(strings.TrimSpace(block), "\n")
+		if len(lines) == 0 || lines[0] == "" {
 			continue
 		}
-
-		// Convert timestamp lines
-		if strings.Contains(line, " --> ") {
-			// SRT: 00:00:20,000 --> 00:00:24,400
-			// VTT: 00:00:20.000 --> 00:00:24.400
-			line = strings.Replace(line, ",", ".", -1)
-			vttContent += line + "\n"
-		} else {
-			vttContent += line + "\n"
+		if _, err := strconv.Atoi(strings.TrimSpace(lines[0])); err == nil {
+			lines = lines[1:]
 		}
+		if len(lines) == 0 || !strings.Contains(lines[0], "-->") {
+			continue
+		}
+		// SRT: 00:00:20,000 --> 00:00:24,400
+		// VTT: 00:00:20.000 --> 00:00:24.400
+		vtt.WriteString(strings.ReplaceAll(lines[0], ",", "."))
+		vtt.WriteString("\n")
+		for _, textLine := range lines[1:] {
+			vtt.WriteString(textLine)
+			vtt.WriteString("\n")
+		}
+		vtt.WriteString("\n")
 	}
 
-	return []byte(vttContent)
+	return []byte(vtt.String())
 }
 
 // Helper function to respond with JSON

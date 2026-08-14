@@ -226,14 +226,14 @@
     </main>
     <div id="settings-model" class="fixed inset-0 z-[999] flex flex-col hidden">
       <!-- model overlay -->
-      <div id="close-settings" class="absolute inset-0 bg-black/70"></div>
+      <div class="close-settings absolute inset-0 bg-black/70"></div>
       <!-- model content -->
       <div
         class="p-6 bg-background rounded-xl shadow-lg w-full max-w-lg m-auto border z-[2]"
       >
         <div class="flex items-center justify-between mb-6">
           <h1 class="text-xl font-semibold">Settings</h1>
-          <button id="close-settings" type="button">
+          <button class="close-settings" type="button">
             <svg
               xmlns="http://www.w3.org/2000/svg"
               width="24"
@@ -328,9 +328,8 @@
           class="tab flex flex-col gap-6"
         >
           <label
-            id="switchInput"
             for="enableProxy"
-            class="flex items-center cursor-pointer"
+            class="switchInput flex items-center cursor-pointer"
           >
             <input id="enableProxy" type="checkbox" class="sr-only" />
             <div
@@ -396,9 +395,8 @@
           class="tab flex flex-col gap-6 hidden"
         >
           <label
-            id="switchInput"
             for="enableProwlarr"
-            class="flex items-center cursor-pointer"
+            class="switchInput flex items-center cursor-pointer"
           >
             <input id="enableProwlarr" type="checkbox" class="sr-only" />
             <div
@@ -474,9 +472,8 @@
           class="tab flex flex-col gap-6 hidden"
         >
           <label
-            id="switchInput"
             for="enableJackett"
-            class="flex items-center cursor-pointer"
+            class="switchInput flex items-center cursor-pointer"
           >
             <input id="enableJackett" type="checkbox" class="sr-only" />
             <div

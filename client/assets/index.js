@@ -141,7 +141,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       form.querySelector("button[type=submit]").removeAttribute("disabled");
       form.querySelector("button[type=submit]").innerHTML = "Play Now";
       form.querySelector("button[type=submit]").classList.remove("loader");
-      document.querySelectorAll("#play-torrent").forEach((el) => {
+      document.querySelectorAll(".play-torrent").forEach((el) => {
         el.removeAttribute("disabled");
         el.innerHTML = "Watch";
         el.classList.remove("loader");
@@ -164,7 +164,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       form.querySelector("button[type=submit]").removeAttribute("disabled");
       form.querySelector("button[type=submit]").innerHTML = "Play Now";
       form.querySelector("button[type=submit]").classList.remove("loader");
-      document.querySelectorAll("#play-torrent").forEach((el) => {
+      document.querySelectorAll(".play-torrent").forEach((el) => {
         el.removeAttribute("disabled");
         el.innerHTML = "Watch";
         el.classList.remove("loader");
@@ -190,7 +190,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       form.querySelector("button[type=submit]").removeAttribute("disabled");
       form.querySelector("button[type=submit]").innerHTML = "Play Now";
       form.querySelector("button[type=submit]").classList.remove("loader");
-      document.querySelectorAll("#play-torrent").forEach((el) => {
+      document.querySelectorAll(".play-torrent").forEach((el) => {
         el.removeAttribute("disabled");
         el.innerHTML = "Watch";
         el.classList.remove("loader");
@@ -264,10 +264,20 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       },
       function () {
         player = this;
-        player.on("error", (e) => {
-          console.error(e);
+        player.on("error", () => {
+          const mediaError = player.error();
+          console.error(mediaError);
+          const messages = {
+            1: "Video loading was aborted",
+            2: "Network error while fetching the video stream",
+            3: "Your browser could not decode this video's codec",
+            4: "This video format is not supported by your browser",
+          };
           butterup.toast({
-            message: "Something went wrong",
+            message:
+              (mediaError && messages[mediaError.code]) ||
+              mediaError?.message ||
+              "Something went wrong",
             location: "top-right",
             icon: true,
             dismissable: true,
@@ -313,7 +323,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     form.querySelector("button[type=submit]").removeAttribute("disabled");
     form.querySelector("button[type=submit]").innerHTML = "Play Now";
     form.querySelector("button[type=submit]").classList.remove("loader");
-    document.querySelectorAll("#play-torrent").forEach((el) => {
+    document.querySelectorAll(".play-torrent").forEach((el) => {
       el.removeAttribute("disabled");
       el.innerHTML = "Watch";
       el.classList.remove("loader");
@@ -321,7 +331,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
   }
 
   // create switch button
-  const switchInputs = document.querySelectorAll("#switchInput");
+  const switchInputs = document.querySelectorAll(".switchInput");
   switchInputs.forEach((input) => {
     input.querySelector("input").addEventListener("change", (e) => {
       const dot = e.target.parentElement.querySelector(".dot");
@@ -340,7 +350,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     document.querySelector("#settings-model").classList.toggle("hidden");
   });
 
-  document.querySelectorAll("#close-settings").forEach((el) => {
+  document.querySelectorAll(".close-settings").forEach((el) => {
     el.addEventListener("click", () => {
       document.querySelector("#settings-model").classList.toggle("hidden");
       document.querySelector("#proxy-result").classList.remove("flex");
@@ -432,17 +442,27 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     const end = start + searchPageSize;
     const results = searchData.slice(start, end);
     results.forEach((result) => {
-      const resultDiv = document.createElement("tr");
-      resultDiv.innerHTML = `
-        <td>${result.title}</td>
-        <td>${result.indexer}</td>
-        <td>${result.size}</td>
-        <td>${result.leechers}/${result.seeders}</td>
-        <td><button id="play-torrent" type="button" class="btn small" data-magnet="${
-          result.downloadUrl || result.magnetUrl
-        }">Watch</button></td>
-      `;
-      searchResults.querySelector("tbody").appendChild(resultDiv);
+      // Build with textContent — indexer data is untrusted
+      const row = document.createElement("tr");
+      [
+        result.title,
+        result.indexer,
+        result.size,
+        `${result.leechers}/${result.seeders}`,
+      ].forEach((text) => {
+        const td = document.createElement("td");
+        td.textContent = text ?? "";
+        row.appendChild(td);
+      });
+      const actionTd = document.createElement("td");
+      const watchBtn = document.createElement("button");
+      watchBtn.type = "button";
+      watchBtn.className = "btn small play-torrent";
+      watchBtn.dataset.magnet = result.downloadUrl || result.magnetUrl || "";
+      watchBtn.textContent = "Watch";
+      actionTd.appendChild(watchBtn);
+      row.appendChild(actionTd);
+      searchResults.querySelector("tbody").appendChild(row);
     });
 
     // Generate pagination
@@ -456,7 +476,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     );
 
     // Add event listener to each play button
-    searchResults.querySelectorAll("#play-torrent").forEach((el) => {
+    searchResults.querySelectorAll(".play-torrent").forEach((el) => {
       el.addEventListener("click", async (e) => {
         const magnet = e.target.getAttribute("data-magnet");
         document.querySelector("#magnet").value = magnet;
@@ -497,22 +517,18 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
 
     let apiUrl = "/api/v1/prowlarr/search";
 
-    if (
-      (!settings.prowlarrHost || !settings.prowlarrApiKey) &&
-      settings.jackettHost &&
-      settings.jackettApiKey
-    ) {
+    if (!settings?.enableProwlarr && settings?.enableJackett) {
       apiUrl = "/api/v1/jackett/search";
     }
 
-    fetch(`${apiUrl}?q=${query}`, {
+    fetch(`${apiUrl}?q=${encodeURIComponent(query)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     })
       .then(async (res) => {
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(res.error || "Failed to fetch search results");
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || "Failed to fetch search results");
         }
         return res.json();
       })
@@ -1053,7 +1069,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         : "Your Jackett API key";
 
       // Set switch button state
-      const switchInputs = document.querySelectorAll("#switchInput");
+      const switchInputs = document.querySelectorAll(".switchInput");
       switchInputs.forEach((input) => {
         const dot = input.querySelector(".dot");
         const wrapper = input.querySelector(".switch-wrapper");
