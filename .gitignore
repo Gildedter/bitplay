@@ -1,1 +1,13 @@
 /.DS_Store
+
+# Runtime data
+/config/
+/torrent-data/
+
+# Build output
+/torrent-stream
+/main
+
+# Local tooling
+/.claude/
+/node_modules/
