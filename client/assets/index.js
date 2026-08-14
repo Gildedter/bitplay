@@ -521,9 +521,13 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       apiUrl = "/api/v1/jackett/search";
     }
 
+    // Give the server its configured timeout plus a little slack
+    const timeoutMs = ((settings?.searchTimeoutSeconds || 30) + 5) * 1000;
+
     fetch(`${apiUrl}?q=${encodeURIComponent(query)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
     })
       .then(async (res) => {
         if (!res.ok) {
@@ -830,6 +834,9 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         enableProwlarr,
         prowlarrHost,
         prowlarrApiKey,
+        searchTimeoutSeconds:
+          parseInt(e.target.querySelector("#prowlarrTimeout").value, 10) || 0,
+        skipTlsVerify: e.target.querySelector("#prowlarrSkipTls").checked,
       };
 
       const response = await fetch("/api/v1/settings/prowlarr", {
@@ -862,6 +869,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
           prowlarrHost: body.prowlarrHost,
           prowlarrApiKeySet:
             !!body.prowlarrApiKey || settings?.prowlarrApiKeySet,
+          searchTimeoutSeconds: body.searchTimeoutSeconds,
+          skipTlsVerify: body.skipTlsVerify,
         };
 
         const prowlarrKeyInput = document.querySelector("#prowlarrApiKey");
@@ -869,6 +878,11 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         if (settings.prowlarrApiKeySet) {
           prowlarrKeyInput.placeholder = "Saved — leave blank to keep";
         }
+
+        // Mirror the shared search options into the Jackett tab
+        document.querySelector("#jackettTimeout").value =
+          body.searchTimeoutSeconds || "";
+        document.querySelector("#jackettSkipTls").checked = body.skipTlsVerify;
 
         // Check if Prowlarr or Jackett is enabled
         if (body?.enableProwlarr || settings?.enableJackett) {
@@ -909,6 +923,9 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       enableJackett,
       jackettHost,
       jackettApiKey,
+      searchTimeoutSeconds:
+        parseInt(e.target.querySelector("#jackettTimeout").value, 10) || 0,
+      skipTlsVerify: e.target.querySelector("#jackettSkipTls").checked,
     };
 
     const response = await fetch("/api/v1/settings/jackett", {
@@ -940,6 +957,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         enableJackett: body.enableJackett,
         jackettHost: body.jackettHost,
         jackettApiKeySet: !!body.jackettApiKey || settings?.jackettApiKeySet,
+        searchTimeoutSeconds: body.searchTimeoutSeconds,
+        skipTlsVerify: body.skipTlsVerify,
       };
 
       const jackettKeyInput = document.querySelector("#jackettApiKey");
@@ -947,6 +966,11 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       if (settings.jackettApiKeySet) {
         jackettKeyInput.placeholder = "Saved — leave blank to keep";
       }
+
+      // Mirror the shared search options into the Prowlarr tab
+      document.querySelector("#prowlarrTimeout").value =
+        body.searchTimeoutSeconds || "";
+      document.querySelector("#prowlarrSkipTls").checked = body.skipTlsVerify;
 
       // Check if Prowlarr or Jackett is enabled
       if (body?.enableJackett || settings?.enableProwlarr) {
@@ -1067,6 +1091,15 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       jackettKeyInput.placeholder = data.jackettApiKeySet
         ? "Saved — leave blank to keep"
         : "Your Jackett API key";
+
+      // Shared search options are shown in both indexer tabs
+      const timeoutValue = data.searchTimeoutSeconds || "";
+      document.querySelector("#prowlarrTimeout").value = timeoutValue;
+      document.querySelector("#jackettTimeout").value = timeoutValue;
+      document.querySelector("#prowlarrSkipTls").checked =
+        data.skipTlsVerify || false;
+      document.querySelector("#jackettSkipTls").checked =
+        data.skipTlsVerify || false;
 
       // Set switch button state
       const switchInputs = document.querySelectorAll(".switchInput");

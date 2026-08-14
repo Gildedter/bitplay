@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,6 +51,21 @@ type Settings struct {
 	EnableJackett  bool   `json:"enableJackett"`
 	JackettHost    string `json:"jackettHost"`
 	JackettApiKey  string `json:"jackettApiKey"`
+	// Outbound Prowlarr/Jackett request tuning (issue #11)
+	SearchTimeoutSeconds int  `json:"searchTimeoutSeconds"`
+	SkipTLSVerify        bool `json:"skipTlsVerify"`
+}
+
+// searchTimeout returns the configured Prowlarr/Jackett timeout, defaulting
+// to 30s for missing/invalid values (also what pre-existing settings.json
+// files without the field decode to).
+func searchTimeout() time.Duration {
+	settingsMutex.RLock()
+	defer settingsMutex.RUnlock()
+	if currentSettings.SearchTimeoutSeconds > 0 {
+		return time.Duration(currentSettings.SearchTimeoutSeconds) * time.Second
+	}
+	return 30 * time.Second
 }
 
 type ProxySettings struct {
@@ -61,12 +77,18 @@ type ProwlarrSettings struct {
 	EnableProwlarr bool   `json:"enableProwlarr"`
 	ProwlarrHost   string `json:"prowlarrHost"`
 	ProwlarrApiKey string `json:"prowlarrApiKey"`
+	// Shared search options, editable from either indexer tab
+	SearchTimeoutSeconds int  `json:"searchTimeoutSeconds"`
+	SkipTLSVerify        bool `json:"skipTlsVerify"`
 }
 
 type JackettSettings struct {
 	EnableJackett bool   `json:"enableJackett"`
 	JackettHost   string `json:"jackettHost"`
 	JackettApiKey string `json:"jackettApiKey"`
+	// Shared search options, editable from either indexer tab
+	SearchTimeoutSeconds int  `json:"searchTimeoutSeconds"`
+	SkipTLSVerify        bool `json:"skipTlsVerify"`
 }
 
 var (
@@ -95,48 +117,68 @@ func formatSize(sizeInBytes float64) string {
 	return fmt.Sprintf("%.2f GB", sizeInGB)
 }
 
-var (
-	proxyTransport = &http.Transport{
-		// copy your existing timeouts & DialContext logic here...
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
-		MaxIdleConnsPerHost:   10,
+var proxyTransport = &http.Transport{
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	IdleConnTimeout:       30 * time.Second,
+	MaxIdleConnsPerHost:   10,
+}
+
+func copyHeadersOnRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("too many redirects")
 	}
-	proxyClient = &http.Client{
-		Transport: proxyTransport,
-		Timeout:   30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return errors.New("too many redirects")
-			}
-			for k, vv := range via[0].Header {
-				if _, ok := req.Header[k]; !ok {
-					req.Header[k] = vv
-				}
-			}
-			return nil
-		},
+	for k, vv := range via[0].Header {
+		if _, ok := req.Header[k]; !ok {
+			req.Header[k] = vv
+		}
 	}
-)
+	return nil
+}
 
 func createSelectiveProxyClient() *http.Client {
 	settingsMutex.RLock()
-	defer settingsMutex.RUnlock()
+	enableProxy := currentSettings.EnableProxy
+	proxyURL := currentSettings.ProxyURL
+	skipVerify := currentSettings.SkipTLSVerify
+	settingsMutex.RUnlock()
 
-	if !currentSettings.EnableProxy {
-		return &http.Client{Timeout: 30 * time.Second}
+	timeout := searchTimeout()
+
+	// For self-signed Prowlarr/Jackett certificates (opt-in setting)
+	var tlsConfig *tls.Config
+	if skipVerify {
+		tlsConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	if !enableProxy {
+		return &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				IdleConnTimeout:       30 * time.Second,
+				MaxIdleConnsPerHost:   10,
+				TLSClientConfig:       tlsConfig,
+			},
+		}
 	}
 	// Reconfigure proxyTransport’s DialContext if URL changed:
-	dialer, _ := createProxyDialer(currentSettings.ProxyURL)
+	dialer, _ := createProxyDialer(proxyURL)
 	proxyTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return dialer.Dial(network, addr)
 	}
+	proxyTransport.TLSClientConfig = tlsConfig
 	// Drop any old idle conns after reconfiguration:
 	proxyTransport.CloseIdleConnections()
 
-	return proxyClient
+	// Fresh client per call: callers may tweak CheckRedirect, and the
+	// timeout tracks the current settings
+	return &http.Client{
+		Transport:     proxyTransport,
+		Timeout:       timeout,
+		CheckRedirect: copyHeadersOnRedirect,
+	}
 }
 
 // Create a proxy dialer for SOCKS5
@@ -354,10 +396,16 @@ func main() {
 	http.HandleFunc("/api/v1/torrent/convert", convertTorrentToMagnetHandler)
 
 	// Set up client file serving
-	http.Handle("/", http.FileServer(http.Dir("./client")))
-	http.HandleFunc("/client/", func(w http.ResponseWriter, r *http.Request) {
-		http.StripPrefix("/client/", http.FileServer(http.Dir("./client"))).ServeHTTP(w, r)
+	// no-cache = browsers revalidate on every load (cheap 304s), so users
+	// pick up new frontend code right after an update instead of running a
+	// stale cached bundle against a newer API
+	fileServer := http.FileServer(http.Dir("./client"))
+	noCacheFiles := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		fileServer.ServeHTTP(w, r)
 	})
+	http.Handle("/", noCacheFiles)
+	http.Handle("/client/", http.StripPrefix("/client/", noCacheFiles))
 	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "./client/favicon.ico")
 	})
@@ -1366,6 +1414,8 @@ func saveProwlarrSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	if newSettings.ProwlarrApiKey != "" {
 		currentSettings.ProwlarrApiKey = newSettings.ProwlarrApiKey
 	}
+	currentSettings.SearchTimeoutSeconds = newSettings.SearchTimeoutSeconds
+	currentSettings.SkipTLSVerify = newSettings.SkipTLSVerify
 	settingsMutex.Unlock()
 
 	if err := saveSettingsToFile(); err != nil {
@@ -1401,6 +1451,8 @@ func saveJackettSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	if newSettings.JackettApiKey != "" {
 		currentSettings.JackettApiKey = newSettings.JackettApiKey
 	}
+	currentSettings.SearchTimeoutSeconds = newSettings.SearchTimeoutSeconds
+	currentSettings.SkipTLSVerify = newSettings.SkipTLSVerify
 	settingsMutex.Unlock()
 
 	if err := saveSettingsToFile(); err != nil {
