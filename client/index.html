@@ -223,6 +223,19 @@
         />
       </div>
       <video id="video-player" class="video-js mt-10 w-full"></video>
+      <div id="subtitle-upload-wrapper" class="hidden w-full mt-3 flex justify-end">
+        <label
+          for="subtitle-file"
+          class="text-sm font-medium text-primary cursor-pointer"
+          >+ Add subtitle file (.srt / .vtt)</label
+        >
+        <input
+          type="file"
+          id="subtitle-file"
+          accept=".srt,.vtt"
+          class="hidden"
+        />
+      </div>
     </main>
     <div id="settings-model" class="fixed inset-0 z-[999] flex flex-col hidden">
       <!-- model overlay -->

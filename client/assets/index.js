@@ -289,6 +289,14 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
     player.doubleTapFF();
 
     document.querySelector("#video-player").style.display = "block";
+
+    // Keep the subtitle-upload control right under the current player
+    // (the video element is re-created for every playback)
+    const subtitleUploadWrapper = document.querySelector(
+      "#subtitle-upload-wrapper"
+    );
+    document.querySelector("main").appendChild(subtitleUploadWrapper);
+    subtitleUploadWrapper.classList.remove("hidden");
     // scroll to video player
     setTimeout(() => {
       window.scrollTo({
@@ -1118,6 +1126,66 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       playTorrentFile(file);
     }
   });
+
+  // Upload a local subtitle file into the current player (issue #15).
+  // Conversion happens in the browser; nothing is sent to the server.
+  const srtToVtt = (srt) => {
+    const text = srt.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+    let vtt = "WEBVTT\n\n";
+    text.split("\n\n").forEach((block) => {
+      const lines = block.trim().split("\n");
+      if (!lines.length || !lines[0]) return;
+      if (/^\d+$/.test(lines[0].trim())) lines.shift();
+      if (!lines.length || !lines[0].includes("-->")) return;
+      vtt +=
+        lines[0].replace(/,/g, ".") + "\n" + lines.slice(1).join("\n") + "\n\n";
+    });
+    return vtt;
+  };
+
+  document
+    .querySelector("#subtitle-file")
+    .addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (!file || !player) {
+        return;
+      }
+
+      const text = await file.text();
+      const vtt = file.name.toLowerCase().endsWith(".vtt")
+        ? text
+        : srtToVtt(text);
+      const blobUrl = URL.createObjectURL(
+        new Blob([vtt], { type: "text/vtt" })
+      );
+
+      const langMatch = file.name.match(/\.([a-z]{2,3})\.(srt|vtt)$/i);
+      const label = file.name.replace(/\.(srt|vtt)$/i, "") || "Uploaded";
+      const added = player.addRemoteTextTrack(
+        {
+          kind: "subtitles",
+          src: blobUrl,
+          srclang: langMatch ? langMatch[1] : "en",
+          label: label,
+        },
+        false
+      );
+
+      // Show the new track right away, hiding whichever was active
+      const tracks = player.textTracks();
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].mode = tracks[i] === added.track ? "showing" : "disabled";
+      }
+
+      butterup.toast({
+        message: `Subtitle "${label}" added`,
+        location: "top-right",
+        icon: true,
+        dismissable: true,
+        type: "success",
+      });
+    });
 
   const torrentFileWrapper = document.querySelector("#torrent_file_wrapper");
   torrentFileWrapper.addEventListener("dragenter", (e) => {
